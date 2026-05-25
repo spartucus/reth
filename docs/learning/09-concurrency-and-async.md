@@ -8,7 +8,7 @@
 
 1. [为什么并发设计如此重要？](#1-为什么并发设计如此重要)
 2. [Tokio 运行时配置](#2-tokio-运行时配置)
-3. [TaskManager / TaskExecutor / TaskSpawner 体系](#3-taskmanager--taskexecutor--taskspawner-体系)
+3. [Runtime / TaskManager 体系](#3-runtime--taskmanager-体系)
 4. [两类任务：普通任务 vs 关键任务](#4-两类任务普通任务-vs-关键任务)
 5. [Shutdown 机制：Signal / Shutdown / GracefulShutdown](#5-shutdown-机制signal--shutdown--gracefulshutdown)
 6. [两类阻塞工作：tokio blocking pool vs rayon pool](#6-两类阻塞工作tokio-blocking-pool-vs-rayon-pool)
@@ -45,18 +45,18 @@ Tokio 异步运行时（多线程，处理 I/O 和轻量任务）
 
 ## 2. Tokio 运行时配置
 
-整个 reth 运行在一个单一的 tokio 多线程运行时上，配置位于 [crates/cli/runner/src/lib.rs:222](../../../crates/cli/runner/src/lib.rs#L222)：
+整个 reth 运行在一个 tokio 多线程运行时上。当前任务系统把 tokio 配置封装到 `crates/tasks/src/runtime.rs` 的 `TokioConfig` / `RuntimeBuilder` 中；CLI runner 负责创建并进入这个运行时。默认 tokio 配置的核心常量是 `DEFAULT_THREAD_KEEP_ALIVE = 15s`：
 
 ```rust
-pub fn tokio_runtime() -> Result<tokio::runtime::Runtime, std::io::Error> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        // Keep the threads alive for at least the block time (12 seconds) plus buffer.
-        // This prevents the costly process of spawning new threads on every
-        // new block, and instead reuses the existing threads.
-        .thread_keep_alive(Duration::from_secs(15))
-        .thread_name("tokio-rt")
-        .build()
+pub const DEFAULT_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+pub enum TokioConfig {
+    Owned {
+        worker_threads: Option<usize>,
+        thread_keep_alive: Duration,
+        thread_name: &'static str,
+    },
+    ExistingHandle(Handle),
 }
 ```
 
@@ -83,35 +83,35 @@ keep_alive = 15 秒（> 12 秒 slot）：
   线程在 slot 结束后短暂休眠，下个 slot 来临时直接复用 → 零线程创建开销
 ```
 
-这个 15 秒的设计同样出现在并行状态根计算的备用运行时中（[root.rs:284](../../../crates/trie/parallel/src/root.rs#L284)），注释一字不差，说明这是整个 reth 的一致设计原则。
+这个 15 秒的设计现在集中在 `crates/tasks/src/runtime.rs`，所有通过 `RuntimeBuilder` 创建的 owned tokio runtime 都会继承这套默认配置。
 
 ---
 
-## 3. TaskManager / TaskExecutor / TaskSpawner 体系
+## 3. Runtime / TaskManager 体系
 
-reth 没有直接使用 `tokio::task::spawn`，而是封装了一套统一的任务管理体系（[crates/tasks/src/lib.rs](../../../crates/tasks/src/lib.rs)）。
+reth 没有在业务代码里到处直接使用 `tokio::task::spawn`，而是通过 `crates/tasks` 提供的 `Runtime` 统一管理异步任务、critical task panic、graceful shutdown 和 rayon 线程池。`TaskExecutor` 现在是 `Runtime` 的类型别名：
+
+```rust
+pub type TaskExecutor = Runtime;
+```
 
 ### 三层结构
 
 ```
-TaskSpawner（trait）
-    │
-    ├── TokioTaskExecutor（轻量实现，直接调 tokio::spawn）
-    │
-    └── TaskExecutor（完整实现，含 shutdown + 监控）
-            ↑
-        由 TaskManager 创建
+RuntimeBuilder
+    └── Runtime（可 clone 的统一执行句柄）
+          ├── tokio Handle
+          ├── TaskManager（监控 critical panic + graceful shutdown）
+          ├── cpu_pool / rpc_pool / storage_pool（rayon，feature=rayon）
+          └── BlockingTaskGuard（RPC tracing 等重任务限流）
 ```
 
-### TaskManager（`lib.rs:206`）
+### TaskManager
 
 ```rust
 pub struct TaskManager {
-    handle: Handle,                              // tokio 运行时句柄
-    task_events_tx: UnboundedSender<TaskEvent>,  // 任务事件发送端
     task_events_rx: UnboundedReceiver<TaskEvent>,// 任务事件接收端
     signal: Option<Signal>,                      // 关机信号（drop 时自动触发）
-    on_shutdown: Shutdown,                       // 关机信号接收端（可 clone）
     graceful_tasks: Arc<AtomicUsize>,            // 正在优雅关机的任务计数
 }
 ```
@@ -136,40 +136,31 @@ impl Future for TaskManager {
 }
 ```
 
-### TaskExecutor（`lib.rs:366`）
+### Runtime
 
-`TaskExecutor` 是可 clone 的任务句柄，每个需要派生任务的组件都持有一份：
-
-```rust
-pub struct TaskExecutor {
-    handle: Handle,                              // tokio 运行时句柄
-    on_shutdown: Shutdown,                       // 关机信号（clone 自 TaskManager）
-    task_events_tx: UnboundedSender<TaskEvent>,  // 向 TaskManager 汇报 panic
-    metrics: TaskExecutorMetrics,                // 任务统计指标
-    graceful_tasks: Arc<AtomicUsize>,            // 与 TaskManager 共享的计数器
-}
-```
-
-**全局访问**：`TaskManager::new()` 会设置 `GLOBAL_EXECUTOR: OnceLock<TaskExecutor>`，之后任何地方都可以通过 `TaskExecutor::current()` 获取。
-
-### TaskSpawner Trait（`lib.rs:137`）
+`Runtime` 是可 clone 的任务句柄，每个需要派生任务的组件都持有一份。它既能把 future 派发到 tokio，也能把同步 CPU/IO 工作派发到专用 rayon 池：
 
 ```rust
-pub trait TaskSpawner: Send + Sync + Unpin + Debug + DynClone {
-    fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
-    fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
-    fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
-    fn spawn_critical_blocking(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()>;
-}
+pub struct Runtime(Arc<RuntimeInner>);
 ```
 
-`DynClone` 使得 `Box<dyn TaskSpawner>` 也可以 clone，方便在结构体中持有动态分发的 spawner。
+常用方法：
+- `spawn_task(fut)`：普通 tokio 任务，响应 shutdown。
+- `spawn_blocking_task(fut)`：把 future 放到 tokio blocking pool 中 `block_on`。
+- `spawn_blocking(func)`：直接使用 tokio blocking pool 执行闭包。
+- `spawn_blocking_named(name, func)` / `try_spawn_blocking_named`：使用 named rayon worker pool 执行闭包。
+- `spawn_blocking_named_or_tokio(name, func)`：优先使用已有 named rayon pool，找不到时回退到 tokio blocking pool。
+- `spawn_critical_task(name, fut)`：critical tokio task，panic 会上报给 `TaskManager`。
+- `spawn_critical_blocking_task(name, fut)`：critical blocking future。
+- `spawn_critical_os_thread(name, func)`：启动受监控的 OS thread。
+
+`Runtime::current()` 可以从当前 tokio context 取得全局 runtime 句柄；`Runtime::builder()` / `RuntimeBuilder` 负责配置 tokio 和 rayon。
 
 ---
 
 ## 4. 两类任务：普通任务 vs 关键任务
 
-### 普通任务（`spawn` / `spawn_blocking`）
+### 普通任务（`spawn_task` / `spawn_blocking_task`）
 
 ```rust
 // 内部实现（lib.rs:438）
@@ -182,10 +173,10 @@ async move {
 
 普通任务被包裹在 `select(on_shutdown, fut)` 中——当关机信号到来时，任务会立即停止（即使原来的 future 还没完成）。这是"快速停止"模式。
 
-### 关键任务（`spawn_critical` / `spawn_critical_blocking`）
+### 关键任务（`spawn_critical_task` / `spawn_critical_blocking_task`）
 
 ```rust
-// 内部实现（lib.rs:504）
+// 内部实现（runtime.rs）
 let task = std::panic::AssertUnwindSafe(fut)
     .catch_unwind()
     .map_err(move |error| {
@@ -199,7 +190,7 @@ let task = std::panic::AssertUnwindSafe(fut)
 
 **关键任务的使用场景**：
 - 网络层：`NetworkManager`（崩溃 = 节点与网络断开）
-- 引擎层：`EngineService`（崩溃 = 无法处理新区块）
+- 引擎层：consensus engine / `ChainOrchestrator`（崩溃 = 无法处理新区块）
 - 持久化层：数据库写入任务
 
 ### 带优雅关机的任务（`spawn_critical_with_graceful_shutdown_signal`）
@@ -221,7 +212,7 @@ executor.spawn_critical_with_graceful_shutdown_signal("grace", |shutdown| async 
 
 ## 5. Shutdown 机制：Signal / Shutdown / GracefulShutdown
 
-关机机制的全貌（[crates/tasks/src/shutdown.rs](../../../crates/tasks/src/shutdown.rs)）：
+关机机制的全貌（[crates/tasks/src/shutdown.rs](../../crates/tasks/src/shutdown.rs)）：
 
 ```
 TaskManager 创建时：
@@ -297,14 +288,14 @@ fn do_graceful_shutdown(self, timeout: Option<Duration>) -> bool {
             debug!("graceful shutdown timed out");
             return false;
         }
-        std::hint::spin_loop();  // CPU 自旋等待
+        thread::yield_now();  // 主动让出 CPU，等待 graceful task 释放 guard
     }
     debug!("gracefully shut down");
     true
 }
 ```
 
-这是一个 **spin loop**（自旋等待），适用于关机时的短暂等待。生产中会配置超时防止无限等待。
+这是关机路径上的短暂等待循环。当前实现使用 `thread::yield_now()`，并支持超时版本防止无限等待。
 
 ---
 
@@ -333,7 +324,7 @@ tokio 的 async 线程不能被阻塞——如果一个 async 任务卡住，整
 
 **tokio blocking pool 的缺点**：CPU 密集型任务如果长时间不让出，会把 blocking pool 占满，其他 blocking 调用（包括 DB 读）就得排队。
 
-### rayon thread pool（`BlockingTaskPool`）
+### rayon thread pools（`BlockingTaskPool` / named worker pools）
 
 适合：**纯 CPU 密集计算**，如状态根哈希、密码学运算、debug_traceTransaction。
 
@@ -341,7 +332,7 @@ tokio 的 async 线程不能被阻塞——如果一个 async 任务卡住，整
 async 任务
   │  需要进行大量 CPU 计算（keccak、Merkle）
   ▼
-blocking_pool.spawn(move || {
+runtime.rpc_pool().spawn(move || {
     // 在 rayon 线程池运行（专门的 CPU 密集线程池）
     compute_state_root(...)
 })
@@ -350,7 +341,7 @@ blocking_pool.spawn(move || {
 
 **为什么 CPU 密集任务不能用 tokio blocking pool？**
 
-引用 reth 代码注释（[pool.rs:47](../../../crates/tasks/src/pool.rs#L47)）：
+引用 reth 代码注释（[pool.rs:47](../../crates/tasks/src/pool.rs#L47)）：
 
 > RPC calls that perform blocking IO (disk lookups) are not executed on this pool but on the tokio runtime's blocking pool, which performs **poorly** with CPU bound tasks. Once the tokio blocking pool is **saturated** it is converted into a queue, blocking tasks could then **interfere** with the queue and block other RPC calls.
 
@@ -421,7 +412,7 @@ impl BlockingTaskGuard {
 }
 ```
 
-`BlockingTaskGuard` 是一个信号量包装器，用于限制并发任务数量。在 RPC 层，`debug_traceTransaction` 等 CPU 密集调用会先 `acquire_owned().await`，拿到 permit 后才开始工作，确保不超过系统容量。
+`BlockingTaskGuard` 是一个信号量包装器，用于限制并发任务数量。在 RPC 层，`debug_traceTransaction` 等 CPU 密集调用会先 `acquire_owned().await`，拿到 permit 后才开始工作，确保不超过系统容量。`Runtime` 还维护了多个 rayon 池：通用 `cpu_pool`、RPC `rpc_pool`、存储写入 `storage_pool`，以及 proof、prewarming、BAL、state trie overlay 等 named worker pools。
 
 ---
 
@@ -588,7 +579,7 @@ Actor 模式配合 `select!` 实现了**单线程并发**：没有锁争用，�
 
 ## 11. 并行状态根：深度案例
 
-并行状态根计算（[crates/trie/parallel/src/root.rs](../../../crates/trie/parallel/src/root.rs)）是 reth 里最能体现多种并发技术综合运用的场景。
+并行状态根计算（[crates/trie/parallel/src/root.rs](../../crates/trie/parallel/src/root.rs)）是 reth 里最能体现多种并发技术综合运用的场景。
 
 ### 为什么需要并行？
 
@@ -760,13 +751,13 @@ Engine API 接收新 payload
 
 `futures_util::future::Shared` 是关键——它允许一个 `Future` 被多个 Waker 监听。触发一次 → 所有等待者全部唤醒，类似于多播机制。
 
-### 决策四：GracefulShutdown 的 spin loop 是 bug 还是设计？
+### 决策四：GracefulShutdown 的等待循环是 bug 还是设计？
 
-`do_graceful_shutdown` 里的自旋等待（`while counter > 0 { spin_loop() }`）看起来低效，但有其合理性：
+`do_graceful_shutdown` 里的等待循环（`while counter > 0 { thread::yield_now() }`）看起来简单，但有其合理性：
 
 - 关机是**罕见操作**（程序生命周期只发生一次）
 - 等待时间预期**极短**（几毫秒到几十毫秒）
-- 自旋比 `park_unpark` 有更低的延迟（不需要操作系统调度）
+- `yield_now` 会主动让出当前线程，避免纯自旋占满 CPU
 - 配合超时（`graceful_shutdown_with_timeout`）防止无限等待
 
 ### 决策五：parking_lot vs std::sync vs tokio::sync 的选型原则
@@ -791,8 +782,8 @@ reth 并发体系一览：
 【顶层】
   tokio multi-thread runtime（工作线程 = CPU 核心数，keep_alive=15s）
       │
-      ├── TaskManager（Future，监控 critical task panic）
-      │       └── TaskExecutor（可 clone，spawn 各类任务）
+      ├── Runtime / TaskExecutor（可 clone，spawn 各类任务）
+      │       └── TaskManager（Future，监控 critical task panic）
       │
       ├── 各 Actor（NetworkManager、EngineTree、PayloadBuilderService...）
       │   每个是一个 Future，单线程无锁，通过 channel 通信

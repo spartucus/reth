@@ -585,12 +585,11 @@ EngineNodeLauncher::launch_node()              [launch/engine.rs]
     │                 │           └─ StageSetBuilder::add_stage(HeaderStage::new(...))
     │                 .build()               ← Pipeline 构建完成，HeaderStage 已注册
     │
-    ├─ EngineService::new(pipeline, ...)
+    ├─ build_engine_orchestrator(pipeline, ...)
     │      └─ ChainOrchestrator::new(handler, PipelineSync::new(pipeline, ...))
     │
     └─ 主循环：
-           engine_service.orchestrator_mut()
-               .start_backfill_sync(initial_target)  [engine.rs:294]
+           orchestrator.start_backfill_sync(initial_target)
 ```
 
 ### 两种触发时机
@@ -600,7 +599,7 @@ EngineNodeLauncher::launch_node()              [launch/engine.rs]
 ```rust
 // launch/engine.rs:291
 if let Some(initial_target) = initial_target {
-    engine_service.orchestrator_mut().start_backfill_sync(initial_target);
+    orchestrator.start_backfill_sync(initial_target);
 }
 ```
 
@@ -628,16 +627,16 @@ ChainOrchestrator::poll_next_event()
               ↑ 保证 Pipeline 运行期间，Engine API 不会并发写库（避免死锁）
 ```
 
-**Pipeline 实际执行**由 `PipelineSync::try_spawn_pipeline` 完成，用 `spawn_critical_blocking`（阻塞型 tokio task）运行：
+**Pipeline 实际执行**由 `PipelineSync::try_spawn_pipeline` 完成，用 `spawn_critical_blocking_task`（阻塞型 tokio task）运行：
 
 ```rust
 // backfill.rs:141
-self.pipeline_task_spawner.spawn_critical_blocking(
+self.pipeline_task_spawner.spawn_critical_blocking_task(
     "pipeline task",
-    Box::pin(async move {
+    async move {
         let result = pipeline.run_as_fut(Some(target)).await;
         let _ = tx.send(result);
-    }),
+    },
 );
 ```
 

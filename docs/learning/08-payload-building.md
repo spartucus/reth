@@ -110,7 +110,7 @@ pub trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>> {
     /// 返回 payload 的构建属性
     fn payload_attributes(&self) -> Result<Self::PayloadAttributes, PayloadBuilderError>;
 
-    /// CL 请求 payload 时调用（engine_getPayloadVx）
+    /// CL 请求 payload 时调用（engine_getPayloadV3）
     /// kind: Earliest（尽快返回）或 WaitForPending（等待在建 payload）
     /// 返回: (结果 Future, 是否保持 Job 存活)
     fn resolve_kind(
@@ -131,17 +131,19 @@ pub enum KeepPayloadJobAlive {
 
 **关键设计**：Job 必须随时能返回"目前最好的 payload"（哪怕是空块），确保永远不会因为构建失败而错过 slot。
 
-### 3.2 PayloadJobGenerator trait（traits.rs:94）
+### 3.2 PayloadJobGenerator trait（traits.rs）
 
 ```rust
 pub trait PayloadJobGenerator {
     type Job: PayloadJob;
 
-    /// forkchoiceUpdated 携带 payloadAttributes 时调用
-    /// 返回一个开始构建的新 Job
+    /// forkchoiceUpdated 携带 payloadAttributes 时调用。
+    /// BuildNewPayload 携带 attributes、version、cancel signal 等构建上下文，
+    /// PayloadId 由 service 生成后传入，Job 需要能立即返回一个初始 payload。
     fn new_payload_job(
         &self,
-        attr: <Self::Job as PayloadJob>::PayloadAttributes,
+        input: BuildNewPayload<<Self::Job as PayloadJob>::PayloadAttributes>,
+        id: PayloadId,
     ) -> Result<Self::Job, PayloadBuilderError>;
 
     /// 新区块被规范化时调用（用于预缓存状态）
@@ -199,10 +201,10 @@ pub struct PayloadBuilderService<Gen, St, T>
 where
     T: PayloadTypes,
     Gen: PayloadJobGenerator,
-    Gen::Job: PayloadJob<PayloadAttributes = T::PayloadBuilderAttributes>,
+    Gen::Job: PayloadJob<PayloadAttributes = T::PayloadAttributes>,
 {
     generator: Gen,
-    payload_jobs: Vec<(Gen::Job, PayloadId)>,   // 所有活跃的构建 Job
+    payload_jobs: Vec<(Gen::Job, PayloadId, Span)>,   // 活跃 Job + tracing span
 
     service_tx: mpsc::UnboundedSender<PayloadServiceCommand<T>>,
     command_rx: UnboundedReceiverStream<PayloadServiceCommand<T>>,
@@ -235,7 +237,7 @@ where
 ```rust
 pub enum PayloadServiceCommand<T: PayloadTypes> {
     /// forkchoiceUpdated 带 payloadAttributes → 启动新 Job
-    BuildNewPayload(T::PayloadBuilderAttributes, oneshot::Sender<Result<PayloadId, ...>>),
+    BuildNewPayload(BuildNewPayload<T::PayloadAttributes>, oneshot::Sender<Result<PayloadId, ...>>),
 
     /// 查询当前最好的 payload（不触发 resolve）
     BestPayload(PayloadId, oneshot::Sender<Option<Result<T::BuiltPayload, ...>>>),
@@ -904,7 +906,7 @@ fn build_empty_payload(&self, config: PayloadConfig<Self::Attributes>)
 | `BasicPayloadJobGenerator` | 创建 Job，管理状态预缓存 | `payload/basic/src/lib.rs:50` |
 | `BasicPayloadJob` | 持续构建循环（1s interval，12s deadline） | `payload/basic/src/lib.rs:302` |
 | `EthereumPayloadBuilder` | 实际 EVM 执行和交易选择 | `ethereum/payload/src/lib.rs:55` |
-| `EthBuiltPayload` | 构建结果，支持 V1-V5 版本转换 | `ethereum/engine-primitives/src/payload.rs` |
+| `EthBuiltPayload` | 构建结果，支持 V1-V6 版本转换 | `ethereum/engine-primitives/src/payload.rs` |
 | `CachedReads` | 跨构建共享磁盘读缓存 | `payload/basic/` |
 | MEV-Boost | 外部构建器接入（标准 Engine API） | 第三方工具，非 reth 内置 |
 

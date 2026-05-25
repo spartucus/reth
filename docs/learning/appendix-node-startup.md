@@ -303,17 +303,17 @@ info!(target: "reth::cli", prune_config=?ctx.prune_config(), "Pruner initialized
 
 ### 第三阶段：Engine 和 RPC（engine.rs:177-409）
 
-**创建 EngineService：**
+**创建 ChainOrchestrator：**
 
 ```rust
-// 源码：crates/node/builder/src/launch/engine.rs:222-238
-let mut engine_service = EngineService::new(
+// 源码：crates/node/builder/src/launch/engine.rs
+let mut orchestrator = build_engine_orchestrator(
+    engine_kind,
     consensus.clone(),
-    ctx.chain_spec(),
     network_client.clone(),
     Box::pin(consensus_engine_stream),
     pipeline,
-    Box::new(ctx.task_executor().clone()),
+    ctx.task_executor().clone(),
     ctx.provider_factory().clone(),
     ctx.blockchain_db().clone(),
     pruner,
@@ -323,8 +323,11 @@ let mut engine_service = EngineService::new(
     ctx.sync_metrics_tx(),
     ctx.components().evm_config().clone(),
     changeset_cache,
+    ctx.task_executor().clone(),
 );
 ```
+
+`build_engine_orchestrator` 位于 `crates/engine/tree/src/launch.rs`。它替代了旧文档里的独立 engine service 描述，负责把 `BasicBlockDownloader`、`PersistenceHandle`、`EngineApiTreeHandler`、`EngineApiRequestHandler`、`EngineHandler` 和 `PipelineSync` 接到一个 `ChainOrchestrator` 流里。
 
 **启动事件聚合任务：**
 
@@ -338,13 +341,13 @@ let events = stream_select!(
     static_file_producer_events.map(Into::into),
 );
 
-ctx.task_executor().spawn_critical(
+ctx.task_executor().spawn_critical_task(
     "events task",
-    Box::pin(node::handle_events(
+    node::handle_events(
         Some(Box::new(ctx.components().network().clone())),
         Some(ctx.head().number),
         events,
-    )),
+    ),
 );
 ```
 
@@ -366,12 +369,13 @@ RPC 启动逻辑在 `crates/node/builder/src/rpc.rs:887-898`（`launch_add_ons_w
 **启动 Consensus Engine 主循环：**
 
 ```rust
-// 源码：crates/node/builder/src/launch/engine.rs:374
-ctx.task_executor().spawn_critical("consensus engine", Box::pin(consensus_engine));
+// 源码：crates/node/builder/src/launch/engine.rs
+ctx.task_executor()
+    .spawn_critical_with_graceful_shutdown_signal("consensus engine", consensus_engine);
 ```
 
-Consensus engine 是一个 `tokio::select!` 循环（`engine.rs:304-370`），处理三类事件：
-- `engine_service.next()`：处理 `ChainEvent`（BackfillSyncFinished, FatalError, Handler 等）
+Consensus engine 是一个 `tokio::select!` 循环，处理三类事件：
+- `orchestrator.next()`：处理 `ChainEvent`（BackfillSyncFinished, FatalError, Handler 等）
 - `built_payloads`：接收本地构建的 payload，注入 engine tree
 - `shutdown_rx`：处理引擎关闭请求
 
@@ -425,7 +429,7 @@ main()
                   |   |-- 初始化 Pruner
                   |
                   |-- 第三阶段：服务启动
-                  |   |-- 创建 EngineService
+                  |   |-- 创建 ChainOrchestrator
                   |   |-- 启动 events 聚合任务
                   |   |-- 启动 RPC 服务器（HTTP/WS + Engine Auth）
                   |   |-- 启动 Consensus Engine 主循环
@@ -465,7 +469,7 @@ main()
 | build_networked_pipeline() | `crates/node/builder/src/setup.rs` | 32-76 |
 | build_pipeline() | `crates/node/builder/src/setup.rs` | 80-135 |
 | launch_add_ons_with() | `crates/node/builder/src/rpc.rs` | 887-898 |
-| EngineService 定义 | `crates/engine/service/src/service.rs` | 57-63 |
+| build_engine_orchestrator() | `crates/engine/tree/src/launch.rs` | 构建 ChainOrchestrator |
 | LaunchNode trait | `crates/node/builder/src/launch/mod.rs` | 24-33 |
 | NodeHandle 定义 | `crates/node/builder/src/handle.rs` | 10-15 |
 | FullNode 定义 | `crates/node/builder/src/node.rs` | 107-126 |
@@ -494,4 +498,4 @@ LaunchContext
 1. **组件初始化顺序**：EVM 先于 Pool（Pool 需要 EVM 配置来验证交易），Pool 先于 Network（Network 需要 Pool 来传播交易），Payload Builder 需要 Pool 和 EVM
 2. **RPC 在 Engine 前启动**：CL 启动后立即通过 Engine API 发送消息，RPC Auth Server 必须先就绪
 3. **Pipeline 启动时执行 `move_to_static_files()`**：确保冷数据已归档，避免启动后触发大量迁移
-4. **使用 `spawn_critical`**：关键任务 panic 会导致节点退出，避免部分功能失效时节点"半死不活"
+4. **使用 `spawn_critical_task` / `spawn_critical_with_graceful_shutdown_signal`**：关键任务 panic 会导致节点退出，避免部分功能失效时节点"半死不活"

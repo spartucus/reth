@@ -41,7 +41,7 @@ Pool<V, T, S>             ← 公共 API（Arc 包装，可克隆共享）
 
 ### PoolInner（核心逻辑）
 
-文件：[`crates/transaction-pool/src/pool/mod.rs:140`](crates/transaction-pool/src/pool/mod.rs#L140)
+文件：[`crates/transaction-pool/src/pool/mod.rs`](../../crates/transaction-pool/src/pool/mod.rs)
 
 ```rust
 pub struct PoolInner<V, T, S>
@@ -74,7 +74,7 @@ where
 
 ### TxPool（四个子池）
 
-文件：[`crates/transaction-pool/src/pool/txpool.rs:89`](crates/transaction-pool/src/pool/txpool.rs#L89)
+文件：[`crates/transaction-pool/src/pool/txpool.rs`](../../crates/transaction-pool/src/pool/txpool.rs)
 
 ```rust
 pub struct TxPool<T: TransactionOrdering> {
@@ -98,7 +98,7 @@ pub struct TxPool<T: TransactionOrdering> {
 
 ## 交易标识系统
 
-文件：[`crates/transaction-pool/src/identifier.rs`](crates/transaction-pool/src/identifier.rs)
+文件：[`crates/transaction-pool/src/identifier.rs`](../../crates/transaction-pool/src/identifier.rs)
 
 交易池内部使用紧凑的数字 ID 替代 20 字节的 `Address`，以节省内存并加速排序比较。
 
@@ -159,7 +159,7 @@ pub const fn descendant(&self) -> Self {
 
 ### TxState 标志位
 
-文件：[`crates/transaction-pool/src/pool/state.rs:16`](crates/transaction-pool/src/pool/state.rs#L16)
+文件：[`crates/transaction-pool/src/pool/state.rs`](../../crates/transaction-pool/src/pool/state.rs)
 
 每笔交易都有一个 8 位的 `TxState`，描述其当前状态，决定它属于哪个子池：
 
@@ -213,7 +213,7 @@ pub enum SubPool {
 
 ### 路由逻辑
 
-文件：[`crates/transaction-pool/src/pool/state.rs:192`](crates/transaction-pool/src/pool/state.rs#L192)
+文件：[`crates/transaction-pool/src/pool/state.rs`](../../crates/transaction-pool/src/pool/state.rs)
 
 ```rust
 impl From<TxState> for SubPool {
@@ -253,7 +253,7 @@ impl From<TxState> for SubPool {
 
 ### PendingPool（待打包池）
 
-文件：[`crates/transaction-pool/src/pool/pending.rs:31`](crates/transaction-pool/src/pool/pending.rs#L31)
+文件：[`crates/transaction-pool/src/pool/pending.rs`](../../crates/transaction-pool/src/pool/pending.rs)
 
 ```rust
 pub struct PendingPool<T: TransactionOrdering> {
@@ -276,7 +276,7 @@ pub struct PendingPool<T: TransactionOrdering> {
 
 ### ParkedPool（停放池）
 
-文件：[`crates/transaction-pool/src/pool/parked.rs`](crates/transaction-pool/src/pool/parked.rs)
+文件：[`crates/transaction-pool/src/pool/parked.rs`](../../crates/transaction-pool/src/pool/parked.rs)
 
 `ParkedPool<T>` 是泛型停放池，有两种实例化：
 
@@ -287,7 +287,7 @@ pub struct PendingPool<T: TransactionOrdering> {
 
 ### BlobTransactions（Blob 子池）
 
-文件：[`crates/transaction-pool/src/pool/blob.rs`](crates/transaction-pool/src/pool/blob.rs)
+文件：[`crates/transaction-pool/src/pool/blob.rs`](../../crates/transaction-pool/src/pool/blob.rs)
 
 `BlobTransactions<T>` 专门存储非 pending 的 EIP-4844 blob 交易。blob 交易比普通交易有更严格的执行条件——不仅要满足 `maxFeePerGas >= baseFee`，还要满足 `maxBlobFeePerGas >= blobBaseFee`。
 
@@ -297,7 +297,7 @@ pub struct PendingPool<T: TransactionOrdering> {
 
 ## 交易优先级排序
 
-文件：[`crates/transaction-pool/src/ordering.rs`](crates/transaction-pool/src/ordering.rs)
+文件：[`crates/transaction-pool/src/ordering.rs`](../../crates/transaction-pool/src/ordering.rs)
 
 ### TransactionOrdering trait
 
@@ -344,7 +344,7 @@ effective_tip = min(maxFeePerGas - baseFee, maxPriorityFeePerGas)
 
 ## BestTransactions 迭代器
 
-文件：[`crates/transaction-pool/src/pool/best.rs:85`](crates/transaction-pool/src/pool/best.rs#L85)
+文件：[`crates/transaction-pool/src/pool/best.rs`](../../crates/transaction-pool/src/pool/best.rs)
 
 `BestTransactions` 是区块构建的核心接口，按优先级顺序产出可执行的交易，同时维护 nonce 依赖不变量。
 
@@ -401,7 +401,7 @@ pub(crate) fn mark_invalid(&mut self, tx: &Arc<ValidPoolTransaction<T::Transacti
 
 ## 验证流程
 
-文件：[`crates/transaction-pool/src/validate/mod.rs:28`](crates/transaction-pool/src/validate/mod.rs#L28)
+文件：[`crates/transaction-pool/src/validate/mod.rs`](../../crates/transaction-pool/src/validate/mod.rs)
 
 ### TransactionValidationOutcome
 
@@ -441,7 +441,7 @@ pub enum ValidTransaction<T> {
 
 ### EthTransactionValidator 检查项
 
-文件：[`crates/transaction-pool/src/validate/eth.rs`](crates/transaction-pool/src/validate/eth.rs)
+文件：[`crates/transaction-pool/src/validate/eth.rs`](../../crates/transaction-pool/src/validate/eth.rs)
 
 `EthTransactionValidator` 执行两类检查：
 
@@ -464,7 +464,7 @@ pub enum ValidTransaction<T> {
 
 ### 总体流程
 
-文件：[`crates/transaction-pool/src/pool/mod.rs:634`](crates/transaction-pool/src/pool/mod.rs#L634)
+文件：[`crates/transaction-pool/src/pool/mod.rs`](../../crates/transaction-pool/src/pool/mod.rs)
 
 ```
 add_transactions(origin, txs)
@@ -491,7 +491,7 @@ add_transactions(origin, txs)
 
 ### TxPool::add_transaction 详解
 
-文件：[`crates/transaction-pool/src/pool/txpool.rs:743`](crates/transaction-pool/src/pool/txpool.rs#L743)
+文件：[`crates/transaction-pool/src/pool/txpool.rs`](../../crates/transaction-pool/src/pool/txpool.rs)
 
 ```rust
 pub(crate) fn add_transaction(
@@ -540,7 +540,7 @@ pub(crate) fn add_transaction(
 
 每当有新区块被规范化（链头推进），交易池必须更新状态：移除已打包的交易、更新账户余额/nonce、响应 baseFee 变化。
 
-文件：[`crates/transaction-pool/src/pool/txpool.rs:652`](crates/transaction-pool/src/pool/txpool.rs#L652)
+文件：[`crates/transaction-pool/src/pool/txpool.rs`](../../crates/transaction-pool/src/pool/txpool.rs)
 
 ```rust
 pub(crate) fn on_canonical_state_change(

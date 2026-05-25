@@ -108,7 +108,7 @@ reth 使用**混合存储架构**，将数据分为三层：
 
 首先，理解 Account 的完整结构：
 
-**文件位置：** `crates/primitives-traits/src/account.rs`
+**类型来源：** `reth_primitives_traits::Account`（外部 crate `reth-primitives-traits`，在本仓库中通过 `crates/storage/db-api/src/tables/mod.rs` 引用）
 
 ```rust
 pub struct Account {

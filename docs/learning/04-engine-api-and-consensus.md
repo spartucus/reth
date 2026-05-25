@@ -36,12 +36,13 @@ Engine API 是**以太坊执行层（EL）与共识层（CL）之间的通信接
 
 ### 核心 API 方法
 
-Engine API 只有两个核心方法（有多个版本，V1-V4）：
+Engine API 的主链路仍然围绕两个核心方法展开，但具体方法版本会随 fork 演进。当前代码同时实现了 JSON-RPC 方法 `engine_newPayloadV1` 到 `engine_newPayloadV5`、`engine_forkchoiceUpdatedV1` 到 `engine_forkchoiceUpdatedV4`、以及 `engine_getPayloadV1` 到 `engine_getPayloadV6`。对应的 Rust handler 是 `new_payload_v1` 到 `new_payload_v5`、`fork_choice_updated_v1` 到 `fork_choice_updated_v4`、`get_payload_v1` 到 `get_payload_v6`。
 
-| 方法 | 方向 | 作用 |
-|------|------|------|
-| `engine_newPayloadVX` | CL → EL | CL 把新区块发给 EL 执行 |
-| `engine_forkchoiceUpdatedVX` | CL → EL | CL 告诉 EL 哪个是最新的规范链头 |
+| JSON-RPC 方法 | Rust handler | 方向 | 作用 |
+|------|------|------|------|
+| `engine_newPayloadV1` 到 `engine_newPayloadV5` | `new_payload_v1` 到 `new_payload_v5` | CL → EL | CL 把新区块发给 EL 执行 |
+| `engine_forkchoiceUpdatedV1` 到 `engine_forkchoiceUpdatedV4` | `fork_choice_updated_v1` 到 `fork_choice_updated_v4` | CL → EL | CL 告诉 EL 哪个是最新的规范链头 |
+| `engine_getPayloadV1` 到 `engine_getPayloadV6` | `get_payload_v1` 到 `get_payload_v6` | CL → EL | CL 按 `payloadId` 取走正在构建或已构建的 payload |
 
 ```
 每 12 秒一个 slot：
@@ -53,6 +54,12 @@ EL 执行区块，返回 VALID/INVALID/SYNCING
     ↓
 CL 通过 engine_forkchoiceUpdatedV3 更新规范链头
 ```
+
+版本大致对应的新增字段：
+- V1/V2：Paris/Shanghai 基础 payload 与 withdrawals。
+- V3：Cancun，新增 blob versioned hashes 与 parent beacon block root。
+- V4：Prague，新增 execution requests 校验。
+- V5/V6：Amsterdam/Osaka 之后的 envelope 扩展，当前代码里 `getPayloadV6` 返回包含 Block Access Lists 的 envelope。
 
 ### 状态返回值
 
@@ -83,9 +90,10 @@ pub enum PayloadStatusEnum {
 ┌────────────────────────────────────────────────────────────────┐
 │  第一层：RPC 接口                                               │
 │  EngineApi (crates/rpc/rpc-engine-api/src/engine_api.rs)       │
-│  - 实现 engine_newPayloadV1-V4                                  │
-│  - 实现 engine_forkchoiceUpdatedV1-V3                           │
-│  - 版本相关字段验证（blob, withdrawals, etc.）                  │
+│  - 实现 engine_newPayloadV1-V5                                  │
+│  - 实现 engine_forkchoiceUpdatedV1-V4                           │
+│  - 实现 engine_getPayloadV1-V6                                  │
+│  - 版本相关字段验证（blob, withdrawals, requests, BAL 等）       │
 └────────────────────────────┬───────────────────────────────────┘
                              │ BeaconEngineMessage (tokio channel)
                              ▼
@@ -127,11 +135,11 @@ pub enum PayloadStatusEnum {
 
 ```rust
 // 典型结构（简化）
-async fn new_payload_v3(&self, payload, versioned_hashes, parent_beacon_block_root)
+async fn new_payload_v3(&self, payload, fork_specific_fields)
     -> RpcResult<PayloadStatus>
 {
-    // 1. 版本字段校验（blob hashes、withdrawals 等）
-    self.payload_validator.validate_v3(...)? ;
+    // 1. 按 EngineApiMessageVersion 做版本字段校验
+    self.payload_validator.validate_version_specific_fields(...)?;
 
     // 2. 发到第二层，等待响应
     let (tx, rx) = oneshot::channel();
@@ -231,12 +239,12 @@ pub struct EngineApiTreeHandler<N, P, T, V, C> {
 ### 完整调用链
 
 ```
-CL: engine_newPayloadV3(payload, versioned_hashes, parent_beacon_block_root)
+CL: engine_newPayloadV3(payload, fork-specific side fields)
     │
     ▼
-EngineApi::new_payload_v3()                    [engine_api.rs:199]
-    │  1. 验证 blob versioned hashes（EIP-4844）
-    │  2. 验证 payload 字段
+EngineApi::new_payload_v3()                    [engine_api.rs]
+    │  1. 根据版本验证 withdrawals/blob hashes/requests/BAL 等字段
+    │  2. 将 RPC payload 转换为 ExecutionData
     │
     ▼ async channel
 EngineHandler::poll()                          [engine.rs]

@@ -117,7 +117,7 @@ pub struct RpcModuleBuilder<N, Provider, Pool, Network, EvmConfig, Consensus> {
     provider: Provider,    // 区块链状态读取
     pool: Pool,            // 交易池
     network: Network,      // P2P 网络
-    executor: Box<dyn TaskSpawner>,
+    executor: Option<Runtime>,
     evm_config: EvmConfig, // EVM 配置
     consensus: Consensus,
     _primitives: PhantomData<N>,

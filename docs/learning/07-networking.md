@@ -265,10 +265,12 @@ pub enum EthVersion {
     Eth68 = 68,  // NewPooledTransactionHashes 携带类型和大小信息
     Eth69 = 69,  // Status 去掉 total_difficulty + 新增 BlockRangeUpdate
     Eth70 = 70,  // 收据去掉 bloom filter（EIP-7688）
+    Eth71 = 71,
+    Eth72 = 72,
 }
 
 pub const LATEST: EthVersion = Eth69;
-pub const ALL_VERSIONS: &[EthVersion] = &[Eth69, Eth68, Eth67, Eth66];  // 优先顺序
+pub const ALL_VERSIONS: &[EthVersion] = &[Eth69, Eth68, Eth67, Eth66];  // 当前启用优先顺序
 ```
 
 ### 各版本关键变化
@@ -292,7 +294,7 @@ pub struct NewPooledTransactionHashes68 {
 - **Status 消息**去掉 `total_difficulty` 字段（PoS 下 TD 已无意义，EIP-7642）
 - 新增 `BlockRangeUpdate`（`0x11`）：节点通知 peer 自己当前能提供哪个区块范围（earliest ~ latest）
 
-**ETH/70**（实验中）：收据去掉 bloom filter，减少传输数据量（EIP-7688）。
+**ETH/70+**：代码中已经保留 `Eth70`、`Eth71`、`Eth72` 枚举和 capability 判断辅助函数，但当前 `LATEST` / `ALL_VERSIONS` 仍只启用到 ETH/69。
 
 ### Status 消息演进
 
@@ -900,7 +902,7 @@ crates/net/
 │       └── config.rs         # 传播策略配置
 ├── eth-wire-types/src/
 │   ├── message.rs            # EthMessageID + EthMessage 枚举
-│   ├── version.rs            # EthVersion（66-70）
+│   ├── version.rs            # EthVersion（66-72，当前默认启用到 69）
 │   └── broadcast.rs          # NewBlock, NewBlockHashes, Transactions
 └── discv4/src/lib.rs         # Discv4 + Kademlia 实现
 ```

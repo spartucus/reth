@@ -377,11 +377,12 @@ EL 节点不是单线程程序，它是一组**相互协作的并发任务**。�
 ```
 crates/tasks/src/lib.rs
 
-TaskManager          # 监控所有任务，处理 panic，协调优雅关闭
-  └─ TaskExecutor    # 任务派发接口，提供四种派发方式：
-      ├─ spawn()                              # 普通异步任务
-      ├─ spawn_critical()                     # 关键任务（panic 则节点退出）
-      ├─ spawn_blocking()                     # 阻塞任务（独立线程池）
+Runtime / TaskExecutor  # 可 clone 的统一任务派发接口
+  └─ TaskManager        # 监控 critical panic，协调优雅关闭：
+      ├─ spawn_task()                         # 普通异步任务
+      ├─ spawn_critical_task()                # 关键任务（panic 则节点退出）
+      ├─ spawn_blocking_task()/spawn_blocking_named()
+      │                                       # tokio blocking 或 named rayon pool
       └─ spawn_critical_with_graceful_shutdown_signal()  # 关键 + 优雅关闭
 ```
 
@@ -706,7 +707,8 @@ let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 reth/crates/
 │
 ├── tasks/                   # 任务管理（spawn/shutdown）
-│   └── src/lib.rs           # TaskManager, TaskExecutor
+│   ├── src/runtime.rs       # Runtime / RuntimeBuilder
+│   └── src/lib.rs           # TaskManager, TaskExecutor alias
 │
 ├── rpc/
 │   ├── rpc-engine-api/      # Engine API（CL↔EL）
@@ -750,7 +752,7 @@ reth/crates/
 - [ ] CL 和 EL 为什么必须通过 JWT 认证连接，而不能用公开接口？
 - [ ] 一笔交易从用户发出到上链，经过了哪些主要环节？
 - [ ] 交易池的 4 个子池分别存放什么类型的交易？
-- [ ] reth 节点内部有哪几类并发任务？`spawn_critical` 和 `spawn` 有什么区别？
+- [ ] reth 节点内部有哪几类并发任务？`spawn_critical_task` 和 `spawn_task` 有什么区别？
 - [ ] `engine_newPayloadV3` 和 `engine_forkchoiceUpdatedV3` 分别在什么时候被调用？
 - [ ] reth 的存储为什么分 MDBX 和静态文件两种？
 - [ ] 并行 EVM 面临的核心问题是什么？Monad 和 MegaETH 分别用什么思路解决？

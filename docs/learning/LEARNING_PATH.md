@@ -180,7 +180,7 @@ crates/rpc/rpc-engine-api/src/
 ```
 
 **核心概念：**
-- Engine API：`engine_newPayloadV3`、`engine_forkchoiceUpdatedV3`
+- Engine API：当前实现覆盖 `newPayloadV1-V5`、`forkchoiceUpdatedV1-V4`、`getPayloadV1-V6`；V3 是 Cancun/blob 主路径，V4+ 覆盖 Prague/Amsterdam/Osaka 相关字段
 - 四层架构：RPC Handler → EngineHandler → EngineApiRequestHandler → EngineTree
 - BackfillSyncState（历史同步状态对实时处理的影响）
 - 四个子池：Pending、BaseFee、Blob、Queued
@@ -280,7 +280,7 @@ crates/net/
 │       └── config.rs         # 传播策略（Sqrt/All/Max）
 ├── eth-wire-types/src/
 │   ├── message.rs            # EthMessageID + 所有消息类型
-│   └── version.rs            # EthVersion（66-70）
+│   └── version.rs            # EthVersion（66-72，当前默认启用到 69）
 └── discv4/src/lib.rs         # Discv4 + Kademlia 实现
 ```
 
@@ -320,7 +320,7 @@ crates/payload/
 └── basic/src/lib.rs         # BasicPayloadJobGenerator + BasicPayloadJob（1s轮询，12s截止）
 
 crates/ethereum/payload/src/lib.rs   # EthereumPayloadBuilder + 贪心选交易算法
-crates/ethereum/engine-primitives/src/payload.rs  # EthBuiltPayload 结构 + V1-V5 转换
+crates/ethereum/engine-primitives/src/payload.rs  # EthBuiltPayload 结构 + V1-V6 转换
 crates/rpc/rpc-api/src/mev.rs        # mev_sendBundle / mev_simBundle 接口定义
 ```
 
@@ -329,7 +329,7 @@ crates/rpc/rpc-api/src/mev.rs        # mev_sendBundle / mev_simBundle 接口定�
 - `BasicPayloadJob`：同时是 Future（持续构建）+ 可查询（best_payload/resolve_kind）
 - `EthereumPayloadBuilder` 贪心算法：按 `effective_tip_per_gas` 降序，逐笔执行检查 gas/RLP/blob 上限
 - `CachedReads`：构建轮次间复用磁盘读缓存，`PrecachedState`：提前缓存新 head 状态供下一 slot 使用
-- `PayloadTaskGuard`：限制最多 3 个并发构建 goroutine；`CancelOnDrop`：job 结束时取消后台任务
+- `PayloadTaskGuard`：限制并发 payload 构建任务；`CancelOnDrop`：job 结束时取消后台任务
 - MEV-boost：外部构建器（Builder API），reth 提供 `mev_sendBundle`/`mev_simBundle`，无内置 relay
 - `EthBuiltPayload`：含 `id, block, fees(U256), sidecars(Empty/Eip4844/Eip7594), requests(Prague+)`
 - `PayloadId`：8 字节 = `SHA256(parentHash‖timestamp‖prevRandao‖feeRecipient‖withdrawals‖parentBeaconBlockRoot)[0..8]`
@@ -350,22 +350,23 @@ crates/rpc/rpc-api/src/mev.rs        # mev_sendBundle / mev_simBundle 接口定�
 **关键代码路径：**
 ```
 crates/tasks/src/
-├── lib.rs           # TaskManager（Future，监控 critical panic）+ TaskExecutor（spawn）
+├── runtime.rs       # Runtime / RuntimeBuilder：tokio + rayon + task spawning
+├── lib.rs           # TaskManager（Future，监控 critical panic）+ TaskExecutor alias
 ├── shutdown.rs      # Signal / Shutdown / GracefulShutdown / GracefulShutdownGuard
 └── pool.rs          # BlockingTaskPool（rayon 封装）+ BlockingTaskGuard（信号量限流）
 
-crates/cli/runner/src/lib.rs        # tokio_runtime()：thread_keep_alive=15s 配置
+crates/tasks/src/runtime.rs         # RuntimeBuilder / TokioConfig：DEFAULT_THREAD_KEEP_ALIVE=15s
 crates/trie/parallel/src/root.rs    # ParallelStateRoot：并行 storage root 计算
 crates/rpc/rpc-eth-api/src/helpers/blocking_task.rs  # SpawnBlocking：IO vs Tracing 两池分工
 ```
 
 **核心概念：**
-- tokio multi-thread runtime：`thread_keep_alive(15s)`（> 12s slot，避免每块重建线程）
-- `TaskManager`（endless Future）+ `TaskExecutor`（cloneable handle）+ `TaskSpawner`（trait）
+- tokio multi-thread runtime：`DEFAULT_THREAD_KEEP_ALIVE = 15s`（> 12s slot，避免每块重建线程）
+- `Runtime`（cloneable handle）统一封装 tokio handle、critical task 监控、graceful shutdown、rayon pools；`TaskExecutor` 是 `Runtime` 的 alias
 - 普通任务 = `select(on_shutdown, fut)`；关键任务 = `catch_unwind` + `TaskEvent::Panic` 上报
 - `Signal` / `Shutdown(Shared<oneshot>)` / `GracefulShutdownGuard(Arc<AtomicUsize>)`
 - 两类阻塞：tokio blocking pool（I/O 密集）vs rayon `BlockingTaskPool`（CPU 密集）
-- `BlockingTaskPool::spawn(f)` → rayon 线程 + `oneshot` 桥接 → `BlockingTaskHandle<R: Future>`
+- `BlockingTaskPool::spawn(f)` → rayon 线程 + `oneshot` 桥接 → `BlockingTaskHandle<R: Future>`；`Runtime` 还维护 cpu/rpc/storage/named worker pools
 - Channel 选型：`oneshot`（单次结果）/ `mpsc unbounded`（命令）/ `mpsc bounded`（防 DoS）/ `std::sync::mpsc::sync_channel(1)`（同步上下文结果传递）
 - `parking_lot::RwLock`（同步热路径）vs `tokio::sync::Semaphore`（async 限流）
 - `tokio::select!` 三种模式：主任务监控 / 信号监听 / Actor 消息循环
@@ -373,7 +374,7 @@ crates/rpc/rpc-eth-api/src/helpers/blocking_task.rs  # SpawnBlocking：IO vs Tra
 
 **检验点：**
 - 能说清楚 `spawn_blocking` 和 `BlockingTaskPool::spawn` 分别用在什么场景，为什么不能混用
-- 能画出 `TaskManager` / `TaskExecutor` / `GracefulShutdownGuard` 三者的协作关系
+- 能画出 `Runtime` / `TaskManager` / `GracefulShutdownGuard` 三者的协作关系
 - 能解释 `ParallelStateRoot` 中为什么用 `std::sync::mpsc::sync_channel` 而非 tokio channel
 
 ---
