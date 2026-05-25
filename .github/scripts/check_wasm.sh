@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-set +e  # Disable immediate exit on error
+set -uxo pipefail
 
-# Array of crates to compile
-crates=($(cargo metadata --format-version=1 --no-deps | jq -r '.packages[].name' | grep '^reth' | sort))
+readarray -t crates < <(
+  cargo metadata --format-version=1 --no-deps | jq -r '.packages[].name' | grep '^reth' | sort
+)
 
-# Array of crates to exclude
-# Used with the `contains` function.
 # shellcheck disable=SC2034
 exclude_crates=(
   # The following require investigation if they can be fixed
   reth-basic-payload-builder
-  reth-bench
   reth-bench-compare
   reth-cli
   reth-cli-commands
@@ -23,6 +21,7 @@ exclude_crates=(
   reth-downloaders
   reth-e2e-test-utils
   reth-engine-service
+  reth-execution-cache
   reth-engine-tree
   reth-engine-util
   reth-eth-wire
@@ -56,6 +55,7 @@ exclude_crates=(
   reth-ress-provider
   # The following are not supposed to be working
   reth # all of the crates below
+  reth-bb # binary-only, uses tokio features unsupported on wasm
   reth-storage-rpc-provider
   reth-invalid-block-hooks # reth-provider
   reth-libmdbx # mdbx
@@ -64,6 +64,7 @@ exclude_crates=(
   reth-provider # tokio
   reth-prune # tokio
   reth-prune-static-files # reth-provider
+  reth-tasks # tokio rt-multi-thread
   reth-stages-api # reth-provider, reth-prune
   reth-static-file # tokio
   reth-transaction-pool # c-kzg
@@ -75,72 +76,47 @@ exclude_crates=(
   reth-era-utils # tokio
   reth-tracing-otlp
   reth-node-ethstats
+  # The following pull in C libraries (secp256k1-sys, zstd-sys) that cannot compile to wasm
+  reth-cli-util       # secp256k1-sys via enr
+  reth-db             # zstd-sys via reth-nippy-jar
+  reth-db-api         # zstd-sys via reth-codecs -> reth-zstd-compressors
+  reth-ecies          # secp256k1-sys via enr
+  reth-network-api    # secp256k1-sys via enr
+  reth-nippy-jar      # zstd-sys (direct dependency)
+  reth-node-types     # zstd-sys via reth-codecs -> reth-zstd-compressors
+  reth-rpc-server-types # secp256k1-sys via reth-network-api -> enr
+  reth-trie-db        # zstd-sys via reth-codecs -> reth-zstd-compressors
 )
 
-# Array to hold the results
-results=()
-# Flag to track if any command fails
 any_failed=0
+tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t reth-check)
+trap 'rm -rf -- "$tmpdir"' EXIT INT TERM
 
-# Function to check if a value exists in an array
 contains() {
   local array="$1[@]"
-  local seeking=$2
-  local in=1
+  local seeking="$2"
+  local element
   for element in "${!array}"; do
-    if [[ "$element" == "$seeking" ]]; then
-      in=0
-      break
-    fi
+    [[ "$element" == "$seeking" ]] && return 0
   done
-  return $in
+  return 1
 }
 
 for crate in "${crates[@]}"; do
   if contains exclude_crates "$crate"; then
-    results+=("3:⏭️:$crate")
+    echo "⏭️ $crate"
     continue
   fi
 
-  cmd="cargo +stable build -p $crate --target wasm32-wasip1 --no-default-features"
-
-  if [ -n "$CI" ]; then
-    echo "::group::$cmd"
+  outfile="$tmpdir/$crate.log"
+  if cargo +stable build -p "$crate" --target wasm32-wasip1 --no-default-features --color never >"$outfile" 2>&1; then
+    echo "✅ $crate"
   else
-    printf "\n%s:\n  %s\n" "$crate" "$cmd"
-  fi
-
-  set +e  # Disable immediate exit on error
-  # Run the command and capture the return code
-  $cmd
-  ret_code=$?
-  set -e  # Re-enable immediate exit on error
-
-  # Store the result in the dictionary
-  if [ $ret_code -eq 0 ]; then
-    results+=("1:✅:$crate")
-  else
-    results+=("2:❌:$crate")
+    echo "❌ $crate"
+    sed 's/^/   /' "$outfile"
+    echo ""
     any_failed=1
   fi
-
-  if [ -n "$CI" ]; then
-    echo "::endgroup::"
-  fi
 done
 
-# Sort the results by status and then by crate name
-IFS=$'\n' sorted_results=($(sort <<<"${results[*]}"))
-unset IFS
-
-# Print summary
-echo -e "\nSummary of build results:"
-for result in "${sorted_results[@]}"; do
-  status="${result#*:}"
-  status="${status%%:*}"
-  crate="${result##*:}"
-  echo "$status $crate"
-done
-
-# Exit with a non-zero status if any command fails
 exit $any_failed

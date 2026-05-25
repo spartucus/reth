@@ -2,7 +2,9 @@ use crate::utils::{advance_with_random_transactions, eth_payload_attributes};
 use alloy_eips::eip7685::RequestsOrHash;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
-use alloy_rpc_types_engine::{PayloadAttributes, PayloadStatusEnum};
+use alloy_rpc_types_engine::{
+    ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadStatus, PayloadStatusEnum,
+};
 use jsonrpsee_core::client::ClientT;
 use reth_chainspec::{ChainSpecBuilder, EthChainSpec, MAINNET};
 use reth_e2e_test_utils::{
@@ -11,17 +13,22 @@ use reth_e2e_test_utils::{
 use reth_node_api::TreeConfig;
 use reth_node_builder::{NodeBuilder, NodeHandle};
 use reth_node_core::{args::RpcServerArgs, node_config::NodeConfig};
-use reth_node_ethereum::EthereumNode;
+use reth_node_ethereum::{engine_ssz_proxy::EngineSszProxyLayer, EthereumAddOns, EthereumNode};
 use reth_provider::BlockNumReader;
 use reth_rpc_api::TestingBuildBlockRequestV1;
-use reth_tasks::TaskManager;
+use reth_rpc_layer::secret_to_bearer_header;
+use reth_tasks::Runtime;
+use ssz::{Decode, Encode};
 use std::sync::Arc;
+
+const ENGINE_NEW_PAYLOAD_V4_ROUTE: &str = "/engine/v4/payloads";
+const ENGINE_FORKCHOICE_UPDATED_V3_ROUTE: &str = "/engine/v3/forkchoice";
 
 #[tokio::test]
 async fn can_run_eth_node() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (mut nodes, _tasks, wallet) = setup::<EthereumNode>(
+    let (mut nodes, wallet) = setup::<EthereumNode>(
         1,
         Arc::new(
             ChainSpecBuilder::default()
@@ -57,8 +64,7 @@ async fn can_run_eth_node() -> eyre::Result<()> {
 #[cfg(unix)]
 async fn can_run_eth_node_with_auth_engine_api_over_ipc() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let exec = TaskManager::current();
-    let exec = exec.executor();
+    let runtime = Runtime::test();
 
     // Chain spec with test allocs
     let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
@@ -76,7 +82,7 @@ async fn can_run_eth_node_with_auth_engine_api_over_ipc() -> eyre::Result<()> {
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http().with_auth_ipc());
 
     let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
-        .testing_node(exec)
+        .testing_node(runtime)
         .node(EthereumNode::default())
         .launch()
         .await?;
@@ -105,8 +111,7 @@ async fn can_run_eth_node_with_auth_engine_api_over_ipc() -> eyre::Result<()> {
 #[cfg(unix)]
 async fn test_failed_run_eth_node_with_no_auth_engine_api_over_ipc_opts() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let exec = TaskManager::current();
-    let exec = exec.executor();
+    let runtime = Runtime::test();
 
     // Chain spec with test allocs
     let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
@@ -121,7 +126,7 @@ async fn test_failed_run_eth_node_with_no_auth_engine_api_over_ipc_opts() -> eyr
     // Node setup
     let node_config = NodeConfig::test().with_chain(chain_spec);
     let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
-        .testing_node(exec)
+        .testing_node(runtime)
         .node(EthereumNode::default())
         .launch()
         .await?;
@@ -139,7 +144,7 @@ async fn test_failed_run_eth_node_with_no_auth_engine_api_over_ipc_opts() -> eyr
 async fn test_engine_graceful_shutdown() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
-    let (mut nodes, _tasks, wallet) = setup::<EthereumNode>(
+    let (mut nodes, wallet) = setup::<EthereumNode>(
         1,
         Arc::new(
             ChainSpecBuilder::default()
@@ -190,8 +195,7 @@ async fn test_engine_graceful_shutdown() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_testing_build_block_v1_osaka() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
-    let tasks = TaskManager::current();
-    let exec = tasks.executor();
+    let runtime = Runtime::test();
 
     let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
     let chain_spec = Arc::new(
@@ -208,7 +212,7 @@ async fn test_testing_build_block_v1_osaka() -> eyre::Result<()> {
         );
 
     let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
-        .testing_node(exec)
+        .testing_node(runtime)
         .node(EthereumNode::default())
         .launch()
         .await?;
@@ -224,6 +228,7 @@ async fn test_testing_build_block_v1_osaka() -> eyre::Result<()> {
         suggested_fee_recipient: Address::ZERO,
         withdrawals: Some(vec![]),
         parent_beacon_block_root: Some(B256::ZERO),
+        slot_number: None,
     };
 
     let request = TestingBuildBlockRequestV1 {
@@ -258,6 +263,158 @@ async fn test_testing_build_block_v1_osaka() -> eyre::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_engine_ssz_proxy_can_mine_block() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+    let runtime = Runtime::test();
+
+    let genesis: Genesis = serde_json::from_str(include_str!("../assets/genesis.json")).unwrap();
+    let chain_spec = Arc::new(
+        ChainSpecBuilder::default()
+            .chain(MAINNET.chain)
+            .genesis(genesis)
+            .prague_activated()
+            .build(),
+    );
+    let genesis_hash = chain_spec.genesis_hash();
+    let node_config =
+        NodeConfig::test().with_chain(chain_spec.clone()).with_unused_ports().with_rpc(
+            RpcServerArgs::default()
+                .with_unused_ports()
+                .with_http()
+                .with_http_api(reth_rpc_server_types::RpcModuleSelection::All),
+        );
+
+    let (ssz_layer, ssz_handle) = EngineSszProxyLayer::new();
+    let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config)
+        .testing_node(runtime)
+        .with_types::<EthereumNode>()
+        .with_components(EthereumNode::components())
+        .with_add_ons(EthereumAddOns::default().with_auth_http_middleware(ssz_layer))
+        .launch()
+        .await?;
+
+    ssz_handle.set_engine(node.add_ons_handle.beacon_engine_handle.clone()).await;
+    let node = NodeTestContext::new(node, eth_payload_attributes).await?;
+
+    let wallet = Wallet::default();
+    let raw_tx = TransactionTestContext::transfer_tx_bytes(1, wallet.inner).await;
+
+    let payload_attributes = PayloadAttributes {
+        timestamp: chain_spec.genesis().timestamp + 1,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Address::ZERO,
+        withdrawals: Some(vec![]),
+        parent_beacon_block_root: Some(B256::ZERO),
+        slot_number: None,
+    };
+
+    let envelope = node
+        .testing_build_block_v1(TestingBuildBlockRequestV1 {
+            parent_block_hash: genesis_hash,
+            payload_attributes,
+            transactions: vec![raw_tx],
+            extra_data: None,
+        })
+        .await?;
+
+    let payload = envelope.execution_payload;
+    let block_hash = payload.payload_inner.payload_inner.block_hash;
+    let client = reqwest::Client::new();
+    let auth_server = node.auth_server_handle();
+    let auth_url = auth_server.http_url();
+    let auth_header = secret_to_bearer_header(auth_server.jwt_secret());
+
+    let new_payload_response = client
+        .post(format!("{auth_url}{ENGINE_NEW_PAYLOAD_V4_ROUTE}"))
+        .header(reqwest::header::AUTHORIZATION, auth_header.to_str()?)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
+        .body(
+            (payload, Vec::<B256>::new(), B256::ZERO, envelope.execution_requests.take())
+                .as_ssz_bytes(),
+        )
+        .send()
+        .await?;
+    assert_eq!(new_payload_response.status(), reqwest::StatusCode::OK);
+
+    let status = PayloadStatus::from_ssz_bytes(&new_payload_response.bytes().await?).unwrap();
+    assert_eq!(status.status, PayloadStatusEnum::Valid);
+
+    let fcu_response = client
+        .post(format!("{auth_url}{ENGINE_FORKCHOICE_UPDATED_V3_ROUTE}"))
+        .header(reqwest::header::AUTHORIZATION, auth_header.to_str()?)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .header(reqwest::header::ACCEPT, "application/octet-stream")
+        .body(
+            (
+                ForkchoiceState {
+                    head_block_hash: block_hash,
+                    safe_block_hash: genesis_hash,
+                    finalized_block_hash: genesis_hash,
+                },
+                Vec::<PayloadAttributes>::new(),
+            )
+                .as_ssz_bytes(),
+        )
+        .send()
+        .await?;
+    assert_eq!(fcu_response.status(), reqwest::StatusCode::OK);
+
+    let fcu = ForkchoiceUpdated::from_ssz_bytes(&fcu_response.bytes().await?).unwrap();
+    assert_eq!(fcu.payload_status.status, PayloadStatusEnum::Valid);
+
+    node.wait_block(1, block_hash, false).await?;
+
+    Ok(())
+}
+
+/// Tests that the sparse trie pipeline can be shared with the payload builder.
+///
+/// Enables both `share_execution_cache_with_payload_builder` and
+/// `share_sparse_trie_with_payload_builder`, then advances multiple blocks with random
+/// transactions. Each FCU spawns a `StateRootHandle` that the payload builder uses for
+/// incremental state root computation instead of blocking `state_root_with_updates()`.
+///
+/// The test validates that all blocks are successfully built and their state roots are
+/// accepted by the engine (newPayload returns VALID).
+#[tokio::test]
+async fn test_share_sparse_trie_with_payload_builder() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let tree_config = TreeConfig::default()
+        .with_legacy_state_root(false)
+        .with_share_execution_cache_with_payload_builder(true)
+        .with_share_sparse_trie_with_payload_builder(true);
+
+    let (mut nodes, _wallet) = setup_engine::<EthereumNode>(
+        1,
+        Arc::new(
+            ChainSpecBuilder::default()
+                .chain(MAINNET.chain)
+                .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
+                .cancun_activated()
+                .prague_activated()
+                .build(),
+        ),
+        false,
+        tree_config,
+        eth_payload_attributes,
+    )
+    .await?;
+
+    let mut node = nodes.pop().unwrap();
+    let mut rng = rand::rng();
+
+    let num_blocks = 5;
+    advance_with_random_transactions(&mut node, num_blocks, &mut rng, true).await?;
+
+    let best_block = node.inner.provider.best_block_number()?;
+    assert_eq!(best_block, num_blocks as u64, "Expected {} blocks, got {}", num_blocks, best_block);
+
+    Ok(())
+}
+
 /// Tests that sparse trie allocation reuse works correctly across consecutive blocks.
 ///
 /// This test exercises the sparse trie allocation reuse path by:
@@ -276,15 +433,16 @@ async fn test_sparse_trie_reuse_across_blocks() -> eyre::Result<()> {
     let tree_config = TreeConfig::default()
         .with_legacy_state_root(false)
         .with_sparse_trie_prune_depth(2)
-        .with_sparse_trie_max_storage_tries(100);
+        .with_sparse_trie_max_hot_slots(100);
 
-    let (mut nodes, _tasks, _wallet) = setup_engine::<EthereumNode>(
+    let (mut nodes, _wallet) = setup_engine::<EthereumNode>(
         1,
         Arc::new(
             ChainSpecBuilder::default()
                 .chain(MAINNET.chain)
                 .genesis(serde_json::from_str(include_str!("../assets/genesis.json")).unwrap())
                 .cancun_activated()
+                .prague_activated()
                 .build(),
         ),
         false,

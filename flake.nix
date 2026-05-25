@@ -1,6 +1,6 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/25.11";
     utils.url = "github:numtide/flake-utils";
     crane.url = "github:ipetkov/crane";
 
@@ -58,7 +58,6 @@
 
         withMaxPerf = prev: {
           cargoBuildCommand = "cargo build --profile=maxperf";
-          cargoExtraArgs = prev.cargoExtraArgs or "" + " --features=jemalloc,asm-keccak";
           RUSTFLAGS = prev.RUSTFLAGS or [] ++ [
             "-Ctarget-cpu=native"
           ];

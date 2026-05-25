@@ -9,11 +9,11 @@ variable "TAG" {
 }
 
 variable "BUILD_PROFILE" {
-  default = "maxperf"
+  default = "maxperf-symbols"
 }
 
 variable "FEATURES" {
-  default = "jemalloc asm-keccak min-debug-logs"
+  default = ""
 }
 
 // Git info for vergen (since .git is excluded from Docker context)
@@ -35,7 +35,7 @@ group "default" {
 }
 
 group "nightly" {
-  targets = ["ethereum", "ethereum-profiling", "ethereum-edge-profiling"]
+  targets = ["ethereum", "ethereum-profiling"]
 }
 
 // Base target with shared configuration
@@ -77,19 +77,41 @@ target "ethereum-profiling" {
     BINARY        = "reth"
     MANIFEST_PATH = "bin/reth"
     BUILD_PROFILE = "profiling"
-    FEATURES      = "jemalloc jemalloc-prof asm-keccak min-debug-logs"
+    FEATURES      = "jemalloc-prof"
   }
   tags = ["${REGISTRY}/reth:nightly-profiling"]
 }
 
-target "ethereum-edge-profiling" {
-  inherits = ["_base_profiling"]
+// Hive test targets — single-platform, hivetests profile, tar output
+target "_base_hive" {
+  inherits  = ["_base"]
+  platforms = ["linux/amd64"]
+  args = {
+    BUILD_PROFILE = "hivetests"
+  }
+}
+
+variable "HIVE_OUTPUT_DIR" {
+  default = "./artifacts"
+}
+
+target "hive" {
+  inherits = ["_base_hive"]
   args = {
     BINARY        = "reth"
     MANIFEST_PATH = "bin/reth"
-    BUILD_PROFILE = "profiling"
-    FEATURES      = "jemalloc jemalloc-prof asm-keccak min-debug-logs edge"
   }
-  tags = ["${REGISTRY}/reth:nightly-edge-profiling"]
+  tags   = ["ghcr.io/paradigmxyz/reth:latest"]
+  output = ["type=docker,dest=${HIVE_OUTPUT_DIR}/reth_image.tar"]
 }
 
+// Kurtosis test target
+target "kurtosis" {
+  inherits  = ["_base_hive"]
+  args = {
+    BINARY        = "reth"
+    MANIFEST_PATH = "bin/reth"
+  }
+  tags   = ["ghcr.io/paradigmxyz/reth:kurtosis-ci"]
+  output = ["type=docker,dest=${HIVE_OUTPUT_DIR}/reth_image.tar"]
+}

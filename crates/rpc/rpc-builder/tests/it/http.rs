@@ -319,6 +319,7 @@ where
         call_request.clone(),
         Some(block_number.into()),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -441,11 +442,27 @@ where
 {
     let block_id = BlockId::Number(BlockNumberOrTag::default());
 
-    DebugApiClient::<TransactionRequest>::raw_header(client, block_id).await.unwrap();
+    DebugApiClient::<TransactionRequest>::raw_header(client, block_id).await.unwrap_err();
     DebugApiClient::<TransactionRequest>::raw_block(client, block_id).await.unwrap_err();
     DebugApiClient::<TransactionRequest>::raw_transaction(client, B256::default()).await.unwrap();
-    DebugApiClient::<TransactionRequest>::raw_receipts(client, block_id).await.unwrap();
+    DebugApiClient::<TransactionRequest>::raw_receipts(client, block_id).await.unwrap_err();
     DebugApiClient::<TransactionRequest>::bad_blocks(client).await.unwrap();
+    DebugApiClient::<TransactionRequest>::debug_account_at(
+        client,
+        block_id,
+        Index::default(),
+        Address::default(),
+    )
+    .await
+    .unwrap_err();
+    DebugApiClient::<TransactionRequest>::debug_account_info_at(
+        client,
+        block_id,
+        Index::default(),
+        Address::default(),
+    )
+    .await
+    .unwrap_err();
 }
 
 async fn test_basic_net_calls<C>(client: &C)
@@ -496,13 +513,14 @@ where
     .err()
     .unwrap();
     TraceApiClient::<TransactionRequest>::trace_block(client, block_id).await.unwrap_err();
-    TraceApiClient::<TransactionRequest>::replay_block_transactions(
+    assert!(TraceApiClient::<TransactionRequest>::replay_block_transactions(
         client,
         block_id,
         HashSet::default(),
     )
     .await
-    .unwrap_err();
+    .unwrap()
+    .is_none());
 
     TraceApiClient::<TransactionRequest>::trace_filter(client, trace_filter).await.unwrap();
 }

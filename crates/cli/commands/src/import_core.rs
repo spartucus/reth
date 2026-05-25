@@ -19,11 +19,12 @@ use reth_node_api::BlockTy;
 use reth_node_events::node::NodeEvent;
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, HeaderProvider, ProviderError, ProviderFactory,
-    StageCheckpointReader,
+    RocksDBProviderFactory, StageCheckpointReader,
 };
 use reth_prune::PruneModes;
 use reth_stages::{prelude::*, ControlFlow, Pipeline, StageId, StageSet};
 use reth_static_file::StaticFileProducer;
+use reth_storage_api::StorageSettingsCache;
 use std::{path::Path, sync::Arc};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -87,6 +88,7 @@ pub async fn import_blocks_from_file<N>(
     config: &Config,
     executor: impl ConfigureEvm<Primitives = N::Primitives> + 'static,
     consensus: Arc<impl FullConsensus<N::Primitives> + 'static>,
+    runtime: reth_tasks::Runtime,
 ) -> eyre::Result<ImportResult>
 where
     N: ProviderNodeTypes,
@@ -107,7 +109,11 @@ where
 
     let provider = provider_factory.provider()?;
     let init_blocks = provider.tx_ref().entries::<tables::HeaderNumbers>()?;
-    let init_txns = provider.tx_ref().entries::<tables::TransactionHashNumbers>()?;
+    let init_txns = if provider_factory.cached_storage_settings().storage_v2 {
+        provider_factory.rocksdb_provider().iter::<tables::TransactionHashNumbers>()?.count()
+    } else {
+        provider.tx_ref().entries::<tables::TransactionHashNumbers>()?
+    };
     drop(provider);
 
     let mut total_decoded_blocks = 0;
@@ -125,13 +131,24 @@ where
     let mut bad_block_number: Option<u64> = None;
     let mut last_valid_block_number: Option<u64> = None;
 
-    while let Some(file_client) =
-        reader.next_chunk::<BlockTy<N>>(consensus.clone(), Some(sealed_header)).await?
+    let skip_invalid_blocks = !import_config.fail_on_invalid_block;
+    while let Some(file_client) = reader
+        .next_chunk_with_invalid_block_handling::<BlockTy<N>>(
+            consensus.clone(),
+            Some(sealed_header.clone()),
+            skip_invalid_blocks,
+        )
+        .await?
     {
         // create a new FileClient from chunk read from file
         info!(target: "reth::import",
             "Importing chain file chunk"
         );
+
+        if file_client.headers_len() == 0 {
+            debug!(target: "reth::import", "Skipping chain file chunk without valid blocks");
+            continue;
+        }
 
         let tip = file_client.tip().ok_or(eyre::eyre!("file client has no tip"))?;
         info!(target: "reth::import", "Chain file chunk read");
@@ -147,6 +164,7 @@ where
             static_file_producer.clone(),
             import_config.no_state,
             executor.clone(),
+            runtime.clone(),
         )?;
 
         // override the tip
@@ -213,8 +231,12 @@ where
 
     let provider = provider_factory.provider()?;
     let total_imported_blocks = provider.tx_ref().entries::<tables::HeaderNumbers>()? - init_blocks;
-    let total_imported_txns =
-        provider.tx_ref().entries::<tables::TransactionHashNumbers>()? - init_txns;
+    let current_txns = if provider_factory.cached_storage_settings().storage_v2 {
+        provider_factory.rocksdb_provider().iter::<tables::TransactionHashNumbers>()?.count()
+    } else {
+        provider.tx_ref().entries::<tables::TransactionHashNumbers>()?
+    };
+    let total_imported_txns = current_txns - init_txns;
 
     let result = ImportResult {
         total_decoded_blocks,
@@ -257,6 +279,7 @@ where
 ///
 /// If configured to execute, all stages will run. Otherwise, only stages that don't require state
 /// will run.
+#[expect(clippy::too_many_arguments)]
 pub fn build_import_pipeline_impl<N, C, E>(
     config: &Config,
     provider_factory: ProviderFactory<N>,
@@ -265,6 +288,7 @@ pub fn build_import_pipeline_impl<N, C, E>(
     static_file_producer: StaticFileProducer<ProviderFactory<N>>,
     disable_exec: bool,
     evm_config: E,
+    runtime: reth_tasks::Runtime,
 ) -> eyre::Result<(Pipeline<N>, impl futures::Stream<Item = NodeEvent<N::Primitives>> + use<N, C, E>)>
 where
     N: ProviderNodeTypes,
@@ -283,7 +307,7 @@ where
 
     let mut header_downloader = ReverseHeadersDownloaderBuilder::new(config.stages.headers)
         .build(file_client.clone(), consensus.clone())
-        .into_task();
+        .into_task_with(&runtime);
     // TODO: The pipeline should correctly configure the downloader on its own.
     // Find the possibility to remove unnecessary pre-configuration.
     header_downloader.update_local_head(local_head);
@@ -291,7 +315,7 @@ where
 
     let mut body_downloader = BodiesDownloaderBuilder::new(config.stages.bodies)
         .build(file_client.clone(), consensus.clone(), provider_factory.clone())
-        .into_task();
+        .into_task_with(&runtime);
     // TODO: The pipeline should correctly configure the downloader on its own.
     // Find the possibility to remove unnecessary pre-configuration.
     body_downloader

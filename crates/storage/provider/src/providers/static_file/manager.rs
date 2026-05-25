@@ -6,12 +6,12 @@ use crate::{
     changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
     to_range, BlockHashReader, BlockNumReader, BlockReader, BlockSource, EitherWriter,
     EitherWriterDestination, HeaderProvider, ReceiptProvider, StageCheckpointReader, StatsReader,
-    TransactionVariant, TransactionsProvider, TransactionsProviderExt, STORAGE_POOL,
+    TransactionVariant, TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::{transaction::TransactionMeta, Header};
 use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber};
 use alloy_primitives::{b256, keccak256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
 use parking_lot::RwLock;
 use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, NamedChain};
@@ -30,7 +30,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
-use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
+use reth_nippy_jar::{NippyJar, NippyJarChecker};
 use reth_node_types::NodePrimitives;
 use reth_primitives_traits::{
     dashmap::DashMap, AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader,
@@ -39,8 +39,8 @@ use reth_primitives_traits::{
 use reth_prune_types::PruneSegment;
 use reth_stages_types::PipelineTarget;
 use reth_static_file_types::{
-    find_fixed_range, ChangesetOffsetReader, HighestStaticFiles, SegmentHeader,
-    SegmentRangeInclusive, StaticFileMap, StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
+    find_fixed_range, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive, StaticFileMap,
+    StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
 };
 use reth_storage_api::{
     BlockBodyIndicesProvider, ChangeSetReader, DBProvider, PruneCheckpointReader,
@@ -245,110 +245,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Creates a new [`StaticFileProvider`] with read-only access.
     ///
-    /// Set `watch_directory` to `true` to track the most recent changes in static files. Otherwise,
-    /// new data won't be detected or queryable.
-    ///
-    /// Watching is recommended if the read-only provider is used on a directory that an active node
-    /// instance is modifying.
-    ///
-    /// See also [`StaticFileProvider::watch_directory`].
-    pub fn read_only(path: impl AsRef<Path>, watch_directory: bool) -> ProviderResult<Self> {
-        let provider = Self::new(path, StaticFileAccess::RO)?;
-
-        if watch_directory {
-            provider.watch_directory();
-        }
-
-        Ok(provider)
+    /// The caller is responsible for calling [`StaticFileProvider::initialize_index`] when
+    /// underlying data changes.
+    pub fn read_only(path: impl AsRef<Path>) -> ProviderResult<Self> {
+        Self::new(path, StaticFileAccess::RO)
     }
 
     /// Creates a new [`StaticFileProvider`] with read-write access.
     pub fn read_write(path: impl AsRef<Path>) -> ProviderResult<Self> {
         Self::new(path, StaticFileAccess::RW)
-    }
-
-    /// Watches the directory for changes and updates the in-memory index when modifications
-    /// are detected.
-    ///
-    /// This may be necessary, since a non-node process that owns a [`StaticFileProvider`] does not
-    /// receive `update_index` notifications from a node that appends/truncates data.
-    pub fn watch_directory(&self) {
-        let provider = self.clone();
-        reth_tasks::spawn_os_thread("sf-watch", move || {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let mut watcher = RecommendedWatcher::new(
-                move |res| tx.send(res).unwrap(),
-                notify::Config::default(),
-            )
-            .expect("failed to create watcher");
-
-            watcher
-                .watch(&provider.path, RecursiveMode::NonRecursive)
-                .expect("failed to watch path");
-
-            // Some backends send repeated modified events
-            let mut last_event_timestamp = None;
-
-            while let Ok(res) = rx.recv() {
-                match res {
-                    Ok(event) => {
-                        // We only care about modified data events
-                        if !matches!(
-                            event.kind,
-                            notify::EventKind::Modify(_) |
-                                notify::EventKind::Create(_) |
-                                notify::EventKind::Remove(_)
-                        ) {
-                            continue;
-                        }
-
-                        // We only trigger a re-initialization if a configuration file was
-                        // modified. This means that a
-                        // static_file_provider.commit() was called on the node after
-                        // appending/truncating rows
-                        for segment in event.paths {
-                            // Ensure it's a file with the .conf extension
-                            if segment
-                                .extension()
-                                .is_none_or(|s| s.to_str() != Some(CONFIG_FILE_EXTENSION))
-                            {
-                                continue;
-                            }
-
-                            // Ensure it's well formatted static file name
-                            if StaticFileSegment::parse_filename(
-                                &segment.file_stem().expect("qed").to_string_lossy(),
-                            )
-                            .is_none()
-                            {
-                                continue;
-                            }
-
-                            // If we can read the metadata and modified timestamp, ensure this is
-                            // not an old or repeated event.
-                            if let Ok(current_modified_timestamp) =
-                                std::fs::metadata(&segment).and_then(|m| m.modified())
-                            {
-                                if last_event_timestamp.is_some_and(|last_timestamp| {
-                                    last_timestamp >= current_modified_timestamp
-                                }) {
-                                    continue;
-                                }
-                                last_event_timestamp = Some(current_modified_timestamp);
-                            }
-
-                            info!(target: "providers::static_file", updated_file = ?segment.file_stem(), "re-initializing static file provider index");
-                            if let Err(err) = provider.initialize_index() {
-                                warn!(target: "providers::static_file", "failed to re-initialize index: {err}");
-                            }
-                            break;
-                        }
-                    }
-
-                    Err(err) => warn!(target: "providers::watcher", "watch error: {err:?}"),
-                }
-            }
-        });
     }
 }
 
@@ -643,7 +548,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
                         StorageBeforeTx {
                             address: revert.address,
-                            key: B256::new(key.to_be_bytes()),
+                            key: B256::from(key.to_be_bytes()),
                             value: revert_to_slot.to_previous_value(),
                         }
                     })
@@ -658,6 +563,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// The closure receives a mutable reference to the segment writer. After the closure completes,
     /// `sync_all()` is called to flush writes to disk.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all, fields(?segment))]
     fn write_segment<F>(
         &self,
         segment: StaticFileSegment,
@@ -682,6 +588,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         blocks: &[ExecutedBlock<N>],
         tx_nums: &[TxNumber],
         ctx: StaticFileWriteCtx,
+        runtime: &reth_tasks::Runtime,
     ) -> ProviderResult<()> {
         if blocks.is_empty() {
             return Ok(());
@@ -696,8 +603,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let mut r_account_changesets = None;
         let mut r_storage_changesets = None;
 
-        STORAGE_POOL.in_place_scope(|s| {
+        // Propagate tracing context into rayon-spawned threads so that per-segment
+        // write spans appear as children of write_blocks_data in traces.
+        let span = tracing::Span::current();
+        runtime.storage_pool().in_place_scope(|s| {
             s.spawn(|_| {
+                let _guard = span.enter();
                 r_headers =
                     Some(self.write_segment(StaticFileSegment::Headers, first_block_number, |w| {
                         Self::write_headers(w, blocks)
@@ -705,6 +616,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             });
 
             s.spawn(|_| {
+                let _guard = span.enter();
                 r_txs = Some(self.write_segment(
                     StaticFileSegment::Transactions,
                     first_block_number,
@@ -714,6 +626,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
             if ctx.write_senders {
                 s.spawn(|_| {
+                    let _guard = span.enter();
                     r_senders = Some(self.write_segment(
                         StaticFileSegment::TransactionSenders,
                         first_block_number,
@@ -724,6 +637,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
             if ctx.write_receipts {
                 s.spawn(|_| {
+                    let _guard = span.enter();
                     r_receipts = Some(self.write_segment(
                         StaticFileSegment::Receipts,
                         first_block_number,
@@ -734,6 +648,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
             if ctx.write_account_changesets {
                 s.spawn(|_| {
+                    let _guard = span.enter();
                     r_account_changesets = Some(self.write_segment(
                         StaticFileSegment::AccountChangeSets,
                         first_block_number,
@@ -744,6 +659,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
             if ctx.write_storage_changesets {
                 s.spawn(|_| {
+                    let _guard = span.enter();
                     r_storage_changesets = Some(self.write_segment(
                         StaticFileSegment::StorageChangeSets,
                         first_block_number,
@@ -1016,6 +932,8 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Returns a list of `SegmentHeader`s from the deleted jars.
     pub fn delete_segment(&self, segment: StaticFileSegment) -> ProviderResult<Vec<SegmentHeader>> {
         let mut deleted_headers = Vec::new();
+
+        self.writers.remove(segment);
 
         while let Some(block_height) = self.get_highest_static_file_block(segment) {
             debug!(
@@ -1485,7 +1403,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         info!(target: "reth::cli", "Healing static file inconsistencies.");
 
         for segment in self.segments_to_check(provider) {
-            let _guard = info_span!("Healing static file segment", ?segment).entered();
+            let _guard = info_span!("healing_static_file_segment", ?segment).entered();
             let _ = self.maybe_heal_segment(segment)?;
         }
 
@@ -2488,31 +2406,6 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
         let range = self.bound_range(range, StaticFileSegment::AccountChangeSets);
         self.walk_account_changeset_range(range).collect()
     }
-
-    fn account_changeset_count(&self) -> ProviderResult<usize> {
-        let mut count = 0;
-
-        let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        if let Some(changeset_segments) = static_files.get(StaticFileSegment::AccountChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::AccountChangeSets.filename(block_range))
-                    .with_extension("csoff");
-                if csoff_path.exists() {
-                    let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
-                        .map_err(ProviderError::other)?;
-                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
-                    for offset in offsets {
-                        count += offset.num_changes() as usize;
-                    }
-                }
-            }
-        }
-
-        Ok(count)
-    }
 }
 
 impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
@@ -2613,31 +2506,6 @@ impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
     ) -> ProviderResult<Vec<(BlockNumberAddress, StorageEntry)>> {
         let range = self.bound_range(range, StaticFileSegment::StorageChangeSets);
         self.walk_storage_changeset_range(range).collect()
-    }
-
-    fn storage_changeset_count(&self) -> ProviderResult<usize> {
-        let mut count = 0;
-
-        let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        if let Some(changeset_segments) = static_files.get(StaticFileSegment::StorageChangeSets) {
-            for (block_range, header) in changeset_segments {
-                let csoff_path = self
-                    .path
-                    .join(StaticFileSegment::StorageChangeSets.filename(block_range))
-                    .with_extension("csoff");
-                if csoff_path.exists() {
-                    let len = header.changeset_offsets_len();
-                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
-                        .map_err(ProviderError::other)?;
-                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
-                    for offset in offsets {
-                        count += offset.num_changes() as usize;
-                    }
-                }
-            }
-        }
-
-        Ok(count)
     }
 }
 

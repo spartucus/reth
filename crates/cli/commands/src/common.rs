@@ -19,7 +19,7 @@ use reth_node_builder::{
     Node, NodeComponents, NodeComponentsBuilder, NodeTypes, NodeTypesWithDBAdapter,
 };
 use reth_node_core::{
-    args::{DatabaseArgs, DatadirArgs, RocksDbArgs, StaticFilesArgs, StorageArgs},
+    args::{DatabaseArgs, DatadirArgs, StaticFilesArgs, StorageArgs},
     dirs::{ChainPath, DataDirPath},
 };
 use reth_provider::{
@@ -27,7 +27,8 @@ use reth_provider::{
         BlockchainProvider, NodeTypesForProvider, RocksDBProvider, StaticFileProvider,
         StaticFileProviderBuilder,
     },
-    ProviderFactory, StaticFileProviderFactory, StorageSettings,
+    BalConfig, BalStoreHandle, InMemoryBalStore, ProviderFactory, StaticFileProviderFactory,
+    StorageSettings,
 };
 use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget};
 use reth_static_file::StaticFileProducer;
@@ -67,67 +68,34 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
     #[command(flatten)]
     pub static_files: StaticFilesArgs,
 
-    /// All `RocksDB` related arguments
-    #[command(flatten)]
-    pub rocksdb: RocksDbArgs,
-
     /// Storage mode configuration (v2 vs v1/legacy)
     #[command(flatten)]
     pub storage: StorageArgs,
 }
 
 impl<C: ChainSpecParser> EnvironmentArgs<C> {
-    /// Returns the effective storage settings derived from `--storage.v2`, static-file, and
-    /// `RocksDB` CLI args.
+    /// Returns the storage settings for new database initialization.
     ///
-    /// The base storage mode is determined by `--storage.v2`:
-    /// - When `--storage.v2` is set: uses [`StorageSettings::v2()`] defaults
-    /// - Otherwise: uses [`StorageSettings::v1()`] defaults
-    ///
-    /// Individual `--static-files.*` and `--rocksdb.*` flags override the base when explicitly set.
+    /// Determined by the `--storage.v2` flag (defaults to `true`).
+    /// Existing databases retain whatever settings are persisted in their
+    /// metadata (checked during genesis init).
     pub fn storage_settings(&self) -> StorageSettings {
-        let mut s = if self.storage.v2 { StorageSettings::v2() } else { StorageSettings::base() };
-
-        // Apply static files overrides (only when explicitly set)
-        if let Some(v) = self.static_files.receipts {
-            s = s.with_receipts_in_static_files(v);
+        if self.storage.v2 {
+            StorageSettings::v2()
+        } else {
+            StorageSettings::v1()
         }
-        if let Some(v) = self.static_files.transaction_senders {
-            s = s.with_transaction_senders_in_static_files(v);
-        }
-        if let Some(v) = self.static_files.account_changesets {
-            s = s.with_account_changesets_in_static_files(v);
-        }
-        if let Some(v) = self.static_files.storage_changesets {
-            s = s.with_storage_changesets_in_static_files(v);
-        }
-
-        // Apply rocksdb overrides
-        // --rocksdb.all sets all rocksdb flags to true
-        if self.rocksdb.all {
-            s = s
-                .with_transaction_hash_numbers_in_rocksdb(true)
-                .with_storages_history_in_rocksdb(true)
-                .with_account_history_in_rocksdb(true);
-        }
-
-        // Individual rocksdb flags override --rocksdb.all when explicitly set
-        if let Some(v) = self.rocksdb.tx_hash {
-            s = s.with_transaction_hash_numbers_in_rocksdb(v);
-        }
-        if let Some(v) = self.rocksdb.storages_history {
-            s = s.with_storages_history_in_rocksdb(v);
-        }
-        if let Some(v) = self.rocksdb.account_history {
-            s = s.with_account_history_in_rocksdb(v);
-        }
-
-        s
     }
 
     /// Initializes environment according to [`AccessRights`] and returns an instance of
     /// [`Environment`].
-    pub fn init<N: CliNodeTypes>(&self, access: AccessRights) -> eyre::Result<Environment<N>>
+    ///
+    /// The provided `runtime` is used for parallel storage I/O.
+    pub fn init<N: CliNodeTypes>(
+        &self,
+        access: AccessRights,
+        runtime: reth_tasks::Runtime,
+    ) -> eyre::Result<Environment<N>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
@@ -168,25 +136,41 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                     .with_genesis_block_number(genesis_block_number)
                     .build()?,
             ),
-            AccessRights::RO | AccessRights::RoInconsistent => {
-                (open_db_read_only(&db_path, self.db.database_args())?, {
-                    let provider = StaticFileProviderBuilder::read_only(sf_path)
-                        .with_metrics()
-                        .with_genesis_block_number(genesis_block_number)
-                        .build()?;
-                    provider.watch_directory();
-                    provider
-                })
-            }
+            AccessRights::RO | AccessRights::RoInconsistent => (
+                open_db_read_only(&db_path, self.db.database_args())?,
+                StaticFileProviderBuilder::read_only(sf_path)
+                    .with_metrics()
+                    .with_genesis_block_number(genesis_block_number)
+                    .build()?,
+            ),
         };
-        let rocksdb_provider = RocksDBProvider::builder(data_dir.rocksdb())
-            .with_default_tables()
-            .with_database_log_level(self.db.log_level)
-            .with_read_only(!access.is_read_write())
-            .build()?;
+        let rocksdb_provider = if !access.is_read_write() && !RocksDBProvider::exists(&rocksdb_path)
+        {
+            // RocksDB database doesn't exist yet (e.g. datadir restored from a snapshot
+            // or created before RocksDB storage). Create an empty one so read-only
+            // commands can proceed.
+            debug!(target: "reth::cli", ?rocksdb_path, "RocksDB not found, initializing empty database");
+            reth_fs_util::create_dir_all(&rocksdb_path)?;
+            let mut builder = RocksDBProvider::builder(data_dir.rocksdb())
+                .with_default_tables()
+                .with_database_log_level(self.db.log_level);
+            if let Some(cache_size) = self.db.rocksdb_block_cache_size {
+                builder = builder.with_block_cache_size(cache_size);
+            }
+            builder.build()?
+        } else {
+            let mut builder = RocksDBProvider::builder(data_dir.rocksdb())
+                .with_default_tables()
+                .with_database_log_level(self.db.log_level)
+                .with_read_only(!access.is_read_write());
+            if let Some(cache_size) = self.db.rocksdb_block_cache_size {
+                builder = builder.with_block_cache_size(cache_size);
+            }
+            builder.build()?
+        };
 
         let provider_factory =
-            self.create_provider_factory(&config, db, sfp, rocksdb_provider, access)?;
+            self.create_provider_factory(&config, db, sfp, rocksdb_provider, access, runtime)?;
         if access.is_read_write() {
             debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
             init_genesis_with_settings(&provider_factory, self.storage_settings())?;
@@ -207,18 +191,26 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         static_file_provider: StaticFileProvider<N::Primitives>,
         rocksdb_provider: RocksDBProvider,
         access: AccessRights,
+        runtime: reth_tasks::Runtime,
     ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
-        let prune_modes = config.prune.segments.clone();
+        let balstore_cache_size =
+            self.db.balstore_cache_size.unwrap_or(BalConfig::DEFAULT_IN_MEMORY_RETENTION_DISTANCE);
+        let bal_store = BalStoreHandle::new(InMemoryBalStore::new(
+            BalConfig::with_in_memory_retention_distance(balstore_cache_size),
+        ));
         let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::new(
             db,
             self.chain.clone(),
             static_file_provider,
             rocksdb_provider,
+            runtime,
         )?
-        .with_prune_modes(prune_modes.clone());
+        .with_prune_modes(config.prune.segments.clone())
+        .with_minimum_pruning_distance(config.prune.minimum_pruning_distance)
+        .with_bal_store(bal_store);
 
         // Check for consistency between database and static files.
         if !access.is_read_only_inconsistent() &&
@@ -252,10 +244,13 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                     NoopBodiesDownloader::default(),
                     NoopEvmConfig::<N::Evm>::default(),
                     config.stages.clone(),
-                    prune_modes.clone(),
+                    config.prune.segments.clone(),
                     None,
                 ))
-                .build(factory.clone(), StaticFileProducer::new(factory.clone(), prune_modes));
+                .build(
+                    factory.clone(),
+                    StaticFileProducer::new(factory.clone(), config.prune.segments.clone()),
+                );
 
             // Move all applicable data from database to static files.
             pipeline.move_to_static_files()?;

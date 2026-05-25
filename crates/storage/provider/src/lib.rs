@@ -12,6 +12,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Utility functions for initializing the database.
+pub mod init;
+
 /// Various provider traits.
 mod traits;
 pub use traits::*;
@@ -28,15 +31,15 @@ pub use providers::{
 pub mod changeset_walker;
 pub mod changesets_utils;
 
-mod storage_threadpool;
-use storage_threadpool::STORAGE_POOL;
-
 #[cfg(any(test, feature = "test-utils"))]
 /// Common test helpers for mocking the Provider.
 pub mod test_utils;
 
 pub mod either_writer;
 pub use either_writer::*;
+
+mod bal;
+pub use bal::{BalConfig, InMemoryBalStore};
 
 pub use reth_chain_state::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotificationStream,
@@ -48,8 +51,9 @@ pub use revm_database::states::OriginalValuesKnown;
 // reexport traits to avoid breaking changes
 pub use reth_static_file_types as static_file;
 pub use reth_storage_api::{
-    HistoryWriter, MetadataProvider, MetadataWriter, StateWriteConfig, StatsReader,
-    StorageSettings, StorageSettingsCache,
+    BalNotification, BalNotificationStream, BalProvider, BalStore, BalStoreHandle,
+    GetBlockAccessListLimit, HistoryWriter, MetadataProvider, MetadataWriter, NoopBalStore,
+    SealedBal, StateWriteConfig, StatsReader, StorageSettings, StorageSettingsCache,
 };
 /// Re-export provider error.
 pub use reth_storage_errors::provider::{ProviderError, ProviderResult};

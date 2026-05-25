@@ -12,7 +12,7 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_evm::ConfigureEvm;
 use reth_primitives_traits::{HeaderTy, SealedBlock};
 use reth_storage_api::BlockReaderIdExt;
-use reth_tasks::TaskSpawner;
+use reth_tasks::Runtime;
 use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::{
     sync,
@@ -155,9 +155,8 @@ impl<Client, Tx, Evm> TransactionValidationTaskExecutor<EthTransactionValidator<
     ///
     /// This will spawn a single validation tasks that performs the actual validation.
     /// See [`TransactionValidationTaskExecutor::eth_with_additional_tasks`]
-    pub fn eth<T, S: BlobStore>(client: Client, evm_config: Evm, blob_store: S, tasks: T) -> Self
+    pub fn eth<S: BlobStore>(client: Client, evm_config: Evm, blob_store: S, tasks: Runtime) -> Self
     where
-        T: TaskSpawner,
         Client: ChainSpecProvider<ChainSpec: EthereumHardforks>
             + BlockReaderIdExt<Header = HeaderTy<Evm::Primitives>>,
         Evm: ConfigureEvm,
@@ -174,15 +173,14 @@ impl<Client, Tx, Evm> TransactionValidationTaskExecutor<EthTransactionValidator<
     ///
     /// This will always spawn a validation task that performs the actual validation. It will spawn
     /// `num_additional_tasks` additional tasks.
-    pub fn eth_with_additional_tasks<T, S: BlobStore>(
+    pub fn eth_with_additional_tasks<S: BlobStore>(
         client: Client,
         evm_config: Evm,
         blob_store: S,
-        tasks: T,
+        tasks: Runtime,
         num_additional_tasks: usize,
     ) -> Self
     where
-        T: TaskSpawner,
         Client: ChainSpecProvider<ChainSpec: EthereumHardforks>
             + BlockReaderIdExt<Header = HeaderTy<Evm::Primitives>>,
         Evm: ConfigureEvm,
@@ -207,6 +205,27 @@ impl<V> TransactionValidationTaskExecutor<V> {
             },
             task,
         )
+    }
+
+    /// Creates a new executor and spawns the validation tasks on the given runtime.
+    ///
+    /// This spawns `additional_tasks` extra blocking tasks plus one critical blocking task
+    /// for the validation service.
+    pub fn spawn(validator: V, tasks: &Runtime, additional_tasks: usize) -> Self {
+        let (tx, task) = ValidationTask::new();
+
+        for _ in 0..additional_tasks {
+            let task = task.clone();
+            tasks.spawn_blocking_task(async move {
+                task.run().await;
+            });
+        }
+
+        tasks.spawn_critical_blocking_task("transaction-validation-service", async move {
+            task.run().await;
+        });
+
+        Self { validator: Arc::new(validator), to_validation_task: Arc::new(sync::Mutex::new(tx)) }
     }
 }
 
@@ -254,8 +273,10 @@ where
 
     async fn validate_transactions(
         &self,
-        transactions: Vec<(TransactionOrigin, Self::Transaction)>,
+        transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction), IntoIter: Send>
+            + Send,
     ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
+        let transactions: Vec<_> = transactions.into_iter().collect();
         let hashes: Vec<_> = transactions.iter().map(|(_, tx)| *tx.hash()).collect();
         let (tx, rx) = oneshot::channel();
         {
@@ -293,14 +314,6 @@ where
                 })
                 .collect(),
         }
-    }
-
-    async fn validate_transactions_with_origin(
-        &self,
-        origin: TransactionOrigin,
-        transactions: impl IntoIterator<Item = Self::Transaction> + Send,
-    ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
-        self.validate_transactions(transactions.into_iter().map(|tx| (origin, tx)).collect()).await
     }
 
     fn on_new_head_block(&self, new_tip_block: &SealedBlock<Self::Block>) {

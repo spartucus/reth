@@ -12,6 +12,9 @@ use crossbeam_channel::Receiver;
 use reth_primitives_traits::Receipt;
 use reth_trie_common::ordered_root::OrderedTrieRootEncodedBuilder;
 use tokio::sync::oneshot;
+use tracing::debug_span;
+
+const RECEIPT_ENCODE_BUF_INITIAL_CAPACITY: usize = 512;
 
 /// Receipt with index, ready to be sent to the background task for encoding and trie building.
 #[derive(Debug, Clone)]
@@ -65,9 +68,16 @@ impl<R: Receipt> ReceiptRootTaskHandle<R> {
     /// * `receipts_len` - The total number of receipts expected. This is needed to correctly order
     ///   the trie keys according to RLP encoding rules.
     pub fn run(self, receipts_len: usize) {
+        let _span = debug_span!(
+            target: "engine::tree::payload_processor",
+            "receipt_root",
+            receipts_len,
+        )
+        .entered();
+
         let mut builder = OrderedTrieRootEncodedBuilder::new(receipts_len);
         let mut aggregated_bloom = Bloom::ZERO;
-        let mut encode_buf = Vec::new();
+        let mut encode_buf = Vec::with_capacity(RECEIPT_ENCODE_BUF_INITIAL_CAPACITY);
         let mut received_count = 0usize;
 
         for indexed_receipt in self.receipt_rx {
@@ -77,22 +87,11 @@ impl<R: Receipt> ReceiptRootTaskHandle<R> {
             receipt_with_bloom.encode_2718(&mut encode_buf);
 
             aggregated_bloom |= *receipt_with_bloom.bloom_ref();
-            match builder.push(indexed_receipt.index, &encode_buf) {
-                Ok(()) => {
-                    received_count += 1;
-                }
-                Err(err) => {
-                    // If a duplicate or out-of-bounds index is streamed, skip it and
-                    // fall back to computing the receipt root from the full receipts
-                    // vector later.
-                    tracing::error!(
-                        target: "engine::tree::payload_processor",
-                        index = indexed_receipt.index,
-                        ?err,
-                        "Receipt root task received invalid receipt index, skipping"
-                    );
-                }
-            }
+            // Receipt indices are produced by the block executor in transaction order and are
+            // bounded by `receipts_len`, so avoid re-validating every streamed receipt on the hot
+            // path. `finalize` below still catches aborted execution that sends too few receipts.
+            builder.push_unchecked(indexed_receipt.index, &encode_buf);
+            received_count += 1;
         }
 
         let Ok(root) = builder.finalize() else {
