@@ -500,8 +500,11 @@ Engine API 是共识层（CL，如 Lighthouse）和执行层（EL，reth）之�
 | `engine_forkchoiceUpdatedV*` | 链头变化 | 通知 EL 当前规范链头，可附带出块指令 |
 | `engine_getPayloadV*` | CL 需要出块 | EL 返回构建好的 payload |
 | `engine_getBlobsV*` | CL 需要 blob | EL 从 BlobStore 返回 blob sidecar |
+| `engine_exchangeCapabilities` | CL/EL 启动握手 | 交换支持的 Engine API 方法列表 |
 
 这些方法的处理流程在[第4章](04-engine-api-and-consensus.md)中已详细介绍。
+
+`rpc-engine-api/src/capabilities.rs` 中的 `EngineCapabilities` 保存 Reth 支持的 Engine API 方法集合。`exchange_capabilities()` 会比较 CL 上报的能力和 EL 本地能力，对关键 `engine_newPayload*`、`engine_forkchoiceUpdated*`、`engine_getPayload*` 等方法不匹配的情况记录告警；对尚未稳定的未来分叉方法则避免产生噪声。
 
 ---
 

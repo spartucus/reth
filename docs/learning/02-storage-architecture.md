@@ -948,6 +948,19 @@ Mem:           8.0G   2.5G   1.0G   4.5G         5.2G
 
 ## 关键文件位置
 
+`Full_code.wiki.md` 对存储层的划分可以对应到当前代码里的这些入口：
+
+| 领域 | 入口 | 作用 |
+|------|------|------|
+| 数据库抽象 | `crates/storage/db-api/` | 定义表、事务、游标和 DupSort 等通用接口 |
+| 本地数据访问 | `crates/storage/provider/` | `ProviderFactory` 统一管理 MDBX、StaticFileProvider 和可选 RocksDB |
+| 远程数据访问 | `crates/storage/rpc-provider/` | 通过外部 RPC 端点实现 provider trait，适合测试、轻量集成和 ExEx 场景 |
+| Trie 通用类型 | `crates/trie/common/` | Trie 输入、节点、证明和更新集等共享类型 |
+| Trie 数据库层 | `crates/trie/db/` | 数据库游标、changeset 缓存、数据库状态根和证明生成 |
+| Trie 并行层 | `crates/trie/parallel/` | 并行状态根和证明计算 |
+| 稀疏 Trie | `crates/trie/sparse/` | 基于 arena 的稀疏 trie，用于高效更新和证明揭示 |
+| 核心 Trie 算法 | `crates/trie/trie/` | MPT 根计算、证明和 witness 生成 |
+
 | 文件 | 行数 | 职责 |
 |------|------|------|
 | `crates/storage/db-api/src/tables/mod.rs` | 538 | 所有数据库表定义 |

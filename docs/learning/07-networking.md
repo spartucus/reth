@@ -45,6 +45,14 @@ crates/net/
 └── downloaders/         # 历史同步的区块下载器
 ```
 
+这些辅助 crate 的边界容易被忽略，但它们对应 `Full_code.wiki.md` 中的网络层拆分：
+
+- `crates/net/dns` 实现 EIP-1459 DNS discovery。`DnsDiscoveryService` 通过 TXT 记录同步 ENR 树，把解析到的 ENR 作为候选节点交给网络层。
+- `crates/net/ecies` 是 RLPX 的加密传输层。`ECIESStream` 负责 auth/ack 握手、帧头/帧体解密和 MAC 校验，`eth-wire` 在其上处理 Hello、Status 和 ETH 消息。
+- `crates/net/downloaders` 提供同步用下载器实现，包括 `ReverseHeadersDownloader`、`BodiesDownloader` 和 `ReceiptFileClient`，由 pipeline/backfill 路径按需使用。
+- `crates/net/banlist` 提供 `BanList` 和 `IpFilter`，用于本地封禁、CIDR 过滤和连接准入控制。
+- `crates/net/network-api` 暴露上层依赖的抽象，例如 `NetworkInfo`、`Peers`、`Transactions`、`BlockDownloaderProvider` 和 `FullNetwork`，避免 RPC、pool、sync 直接依赖 `NetworkManager` 的内部状态。
+
 ### 核心组件关系
 
 ```
