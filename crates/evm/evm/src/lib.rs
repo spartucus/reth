@@ -320,6 +320,10 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         DB: Database,
         I: InspectorFor<Self, &'a mut State<DB>> + 'a,
     {
+        ::tracing::debug!(
+            target: "my-learning",
+            "ConfigureEvm::create_executor Enter"
+        );
         self.block_executor_factory().create_executor(evm, ctx)
     }
 
@@ -329,6 +333,10 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         db: &'a mut State<DB>,
         block: &'a SealedBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<impl BlockExecutorFor<'a, Self::BlockExecutorFactory, DB>, Self::Error> {
+        ::tracing::debug!(
+            target: "my-learning",
+            "ConfigureEvm::executor_for_block Enter"
+        );
         let evm = self.evm_for_block(db, block.header())?;
         let ctx = self.context_for_block(block)?;
         Ok(self.create_executor(evm, ctx))

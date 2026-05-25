@@ -558,6 +558,8 @@ where
         &self,
         transaction: <N::Pool as TransactionPool>::Transaction,
     ) -> Result<AddedTransactionOutcome, EthApiError> {
+        use reth_transaction_pool::PoolTransaction;
+        tracing::debug!(target: "my-learning", hash = %transaction.hash(), "[2/5] EthApi::add_pool_transaction → sending to BatchTxProcessor");
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let request = reth_transaction_pool::BatchTxRequest::new(transaction, response_tx);
 

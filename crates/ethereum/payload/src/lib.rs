@@ -176,6 +176,7 @@ where
     let chain_spec = client.chain_spec();
 
     debug!(target: "payload_builder", id=%attributes.id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
+    debug!(target: "my-learning", parent_number = parent_header.number, "[5a/5] default_ethereum_payload → building block, selecting txs from pool");
     let mut cumulative_gas_used = 0;
     let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
     let base_fee = builder.evm_mut().block().basefee();
@@ -303,6 +304,7 @@ where
             };
         }
 
+        debug!(target: "my-learning", hash = %tx.hash(), "[5b/5] execute_transaction in payload builder → EVM executing tx");
         let gas_used = match builder.execute_transaction(tx.clone()) {
             Ok(gas_used) => gas_used,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {

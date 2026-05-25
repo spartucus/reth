@@ -29,6 +29,7 @@ impl CliRunner {
     ///
     /// The default tokio runtime is multi-threaded, with both I/O and time drivers enabled.
     pub fn try_default_runtime() -> Result<Self, std::io::Error> {
+        debug!(target: "my-learning", "CliRunner::try_default_runtime");
         Ok(Self { config: CliRunnerConfig::default(), tokio_runtime: tokio_runtime()? })
     }
 

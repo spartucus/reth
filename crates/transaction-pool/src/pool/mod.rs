@@ -557,6 +557,7 @@ where
         origin: TransactionOrigin,
         tx: TransactionValidationOutcome<T::Transaction>,
     ) -> (PoolResult<AddedTransactionOutcome>, Option<AddedTransactionMeta<T::Transaction>>) {
+        debug!(target: "my-learning", is_valid = matches!(tx, TransactionValidationOutcome::Valid { .. }), "[4/5] PoolInner::add_transaction → inserting into subpool");
         match tx {
             TransactionValidationOutcome::Valid {
                 balance,

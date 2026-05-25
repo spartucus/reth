@@ -12,7 +12,7 @@ use reth::{args::RessArgs, cli::Cli, ress::install_ress_subprotocol};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_builder::NodeHandle;
 use reth_node_ethereum::EthereumNode;
-use tracing::info;
+use tracing::{info, debug};
 
 fn main() {
     reth_cli_util::sigsegv_handler::install();
@@ -21,6 +21,11 @@ fn main() {
     if std::env::var_os("RUST_BACKTRACE").is_none() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+
+    debug!(
+        target: "my-learning",
+        "Main",
+    );
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, RessArgs>::parse().run(async move |builder, ress_args| {

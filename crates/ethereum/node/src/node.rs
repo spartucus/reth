@@ -441,6 +441,7 @@ where
     type EVM = EthEvmConfig<Types::ChainSpec>;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
+        debug!(target: "my-learning", "EthereumExecutorBuilder::build_evm");
         Ok(EthEvmConfig::new(ctx.chain_spec()))
     }
 }
@@ -471,6 +472,7 @@ where
         ctx: &BuilderContext<Node>,
         evm_config: Evm,
     ) -> eyre::Result<Self::Pool> {
+        debug!(target: "my-learning", "EthereumPoolBuilder::build_pool");
         let pool_config = ctx.pool_config();
 
         let blobs_disabled = ctx.config().txpool.disable_blobs_support ||
@@ -551,6 +553,7 @@ where
         ctx: &BuilderContext<Node>,
         pool: Pool,
     ) -> eyre::Result<Self::Network> {
+        debug!(target: "my-learning", "EthereumNetworkBuilder::build_network");
         let network = ctx.network_builder().await?;
         let handle = ctx.start_network(network, pool);
         info!(target: "reth::cli", enode=%handle.local_node_record(), "P2P networking initialized");
@@ -573,6 +576,7 @@ where
     type Consensus = Arc<EthBeaconConsensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
+        debug!(target: "my-learning", "EthereumConsensusBuilder::build_consensus");
         Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec())))
     }
 }

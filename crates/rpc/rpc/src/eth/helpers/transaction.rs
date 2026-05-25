@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::EthApi;
-use alloy_consensus::BlobTransactionValidationError;
+use alloy_consensus::{BlobTransactionValidationError, transaction::TxHashRef};
 use alloy_eips::{eip7594::BlobTransactionSidecarVariant, BlockId, Typed2718};
 use alloy_primitives::{hex, B256};
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
@@ -41,6 +41,7 @@ where
         tx: WithEncoded<Recovered<PoolPooledTx<Self::Pool>>>,
     ) -> Result<B256, Self::Error> {
         let (tx, recovered) = tx.split();
+        tracing::debug!(target: "my-learning", hash = %recovered.tx_hash(), "[1/5] RPC eth_sendRawTransaction → EthTransactions::send_transaction");
         let mut pool_transaction =
             <Self::Pool as TransactionPool>::Transaction::from_pooled(recovered);
 

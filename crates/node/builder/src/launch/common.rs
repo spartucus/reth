@@ -143,6 +143,7 @@ impl LaunchContext {
     where
         ChainSpec: EthChainSpec + reth_chainspec::EthereumHardforks,
     {
+        debug!(target: "my-learning", "LaunchContext::with_loaded_toml_config");
         let toml_config = self.load_toml_config(&config)?;
         Ok(self.with(WithConfigs { config, toml_config }))
     }
@@ -219,6 +220,7 @@ impl LaunchContext {
     ///   engine.reserved-cpu-cores to reserve given number of cores for O while using at least 1
     ///   core for the rayon thread pool
     pub fn configure_globals(&self, reserved_cpu_cores: usize) {
+        debug!(target: "my-learning", "LaunchContext::configure_globals");
         // Raise the fd limit of the process.
         // Does not do anything on windows.
         match fdlimit::raise_fd_limit() {
@@ -479,6 +481,7 @@ where
         N: ProviderNodeTypes<DB = DB, ChainSpec = ChainSpec>,
         Evm: ConfigureEvm<Primitives = N::Primitives> + 'static,
     {
+        debug!(target: "my-learning", "LaunchContextWith::create_provider_factory");
         // Validate static files configuration
         let static_files_config = &self.toml_config().static_files;
         static_files_config.validate()?;
@@ -654,6 +657,7 @@ where
 
     /// Convenience function to [`Self::init_genesis`]
     pub fn with_genesis(self) -> Result<Self, InitStorageError> {
+        debug!(target: "my-learning", "LaunchContextWith::with_genesis");
         init_genesis_with_settings(self.provider_factory(), self.node_config().storage_settings())?;
         Ok(self)
     }
@@ -715,6 +719,7 @@ where
         T: FullNodeTypes<Types = N, DB = DB>,
         F: FnOnce(ProviderFactory<NodeTypesWithDBAdapter<N, DB>>) -> eyre::Result<T::Provider>,
     {
+        debug!(target: "my-learning", "LaunchContextWith::with_blockchain_db");
         let blockchain_db = create_blockchain_provider(self.provider_factory().clone())?;
 
         let metered_providers = WithMeteredProviders {
@@ -787,6 +792,7 @@ where
     where
         CB: NodeComponentsBuilder<T>,
     {
+        debug!(target: "my-learning", "LaunchContextWith::with_components");
         // fetch the head block from the database
         let head = self.lookup_head()?;
 

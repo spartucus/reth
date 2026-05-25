@@ -554,13 +554,27 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
+        ::tracing::debug!(
+            target: "my-learning",
+            "Executor for BasicBlockExecutor execute_one Enter"
+        );
         let result = self
             .strategy_factory
             .executor_for_block(&mut self.db, block)
             .map_err(BlockExecutionError::other)?
             .execute_block(block.transactions_recovered())?;
 
+        ::tracing::debug!(
+            target: "my-learning",
+            "Executor for BasicBlockExecutor execute_one BlockExecutor::execute_block done"
+        );
+
         self.db.merge_transitions(BundleRetention::Reverts);
+
+        ::tracing::debug!(
+            target: "my-learning",
+            "Executor for BasicBlockExecutor execute_one State::merge_transitions done"
+        );
 
         Ok(result)
     }

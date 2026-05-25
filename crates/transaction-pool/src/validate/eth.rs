@@ -230,6 +230,7 @@ where
         transaction: Tx,
         maybe_state: &mut Option<Box<dyn AccountInfoReader + Send>>,
     ) -> TransactionValidationOutcome<Tx> {
+        tracing::debug!(target: "my-learning", hash = %transaction.hash(), "[3/5] EthTransactionValidator::validate_one_with_provider");
         match self.validate_one_no_state(origin, transaction) {
             Ok(transaction) => {
                 // stateless checks passed, pass transaction down stateful validation pipeline
