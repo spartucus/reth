@@ -15,6 +15,7 @@
   - [5. State Root 增量计算](#5-state-root-增量计算)
   - [6. Static Files 列式存储](#6-static-files-列式存储)
   - [7. Sharded History Index](#7-sharded-history-index)
+  - [8. PayloadJob - 可取消的增量 Payload 构建](#8-payloadjob---可取消的增量-payload-构建)
 
 ---
 
@@ -644,6 +645,208 @@ if list.contains(150000) {
 
 ---
 
+### 8. PayloadJob - 可取消的增量 Payload 构建
+
+**位置**: [`crates/payload/builder/src/traits.rs:23`](../../crates/payload/builder/src/traits.rs#L23)
+
+#### 设计目的
+
+在以太坊 PoS 架构里，执行客户端不是想什么时候出块就什么时候出块，而是响应共识层的 Engine API 请求：
+
+- `engine_forkchoiceUpdated` 触发一个新的 payload 构建任务
+- `engine_getPayload` 要求执行客户端在很短时间内返回可用区块
+- 共识层拿到 payload 后，客户端可以继续构建，也可以停止
+
+`PayloadJob` 的设计就是把这些协议约束直接编码成 Rust 的异步任务接口：**构建任务可以持续改进 payload，但任何时刻都必须能返回当前最好的结果**。
+
+#### 核心实现
+
+```rust
+// 源码：crates/payload/builder/src/traits.rs:23
+pub trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>> {
+    type PayloadAttributes: PayloadAttributes + std::fmt::Debug;
+    type ResolvePayloadFuture: Future<Output = Result<Self::BuiltPayload, PayloadBuilderError>>
+        + Send
+        + 'static;
+    type BuiltPayload: BuiltPayload + Clone + std::fmt::Debug;
+
+    fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError>;
+
+    fn resolve_kind(
+        &mut self,
+        kind: PayloadKind,
+    ) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive);
+}
+```
+
+最有意思的一点是：`PayloadJob` 本身是一个 `Future`，但这个 `Future` 的输出不是最终区块。
+
+```rust
+pub trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>>
+```
+
+也就是说，任务完成只代表“构建过程结束了”，而不是“这里有一个 payload”。真正交给共识层的是：
+
+```rust
+fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError>;
+fn resolve_kind(...) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive);
+```
+
+这和普通后台任务的模型不一样。普通任务通常是：
+
+```rust
+// 普通异步任务：等它完成后拿结果
+let payload = job.await?;
+```
+
+但 payload builder 的现实是：
+
+```rust
+// Engine API 的现实：共识层来要的时候，必须马上给当前最好的结果
+let (payload_future, keep_alive) = job.resolve_kind(PayloadKind::Earliest);
+let payload = payload_future.await?;
+```
+
+#### 为什么不能等任务完成？
+
+因为区块构建是一个“越构建越好”的过程，而不是一个瞬间完成的计算。
+
+构建 payload 时，执行客户端通常会：
+
+1. 先准备一个空块或近似空块，保证有东西可以返回
+2. 从交易池里选交易
+3. 执行交易，更新 gas、receipts、state root 等结果
+4. 在时间允许的情况下继续填充更高价值的交易
+5. 如果共识层提前请求，就返回当前最好的版本
+
+如果接口设计成 `job.await -> payload`，就会隐含一个错误假设：payload 构建有一个明确的“完成时刻”。但在 PoS 出块流程里，真正重要的是 slot deadline。共识层宁可要一个收益稍低但准时的块，也不能因为执行客户端还在优化交易选择而错过 slot。
+
+所以 `PayloadJob` 把“构建完成”和“返回 payload”拆开：
+
+| 概念 | 方法 | 含义 |
+|------|------|------|
+| 构建过程生命周期 | `Future<Output = Result<(), PayloadBuilderError>>` | 构建任务什么时候结束 |
+| 当前最佳结果 | `best_payload()` | 随时读取已经构建出的最好 payload |
+| 共识层请求结果 | `resolve_kind()` | 按 Engine API 时限返回 payload |
+| 请求后是否继续 | `KeepPayloadJobAlive` | payload 被取走后任务是否继续运行 |
+
+#### PayloadKind：把“快”和“等”变成显式策略
+
+`resolve_kind` 接收一个 `PayloadKind`：
+
+```rust
+fn resolve_kind(
+    &mut self,
+    kind: PayloadKind,
+) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive);
+```
+
+这里的核心不是简单返回 payload，而是允许调用方表达不同策略：
+
+- `PayloadKind::Earliest`：尽快返回可用 payload，必要时返回空块或当前最佳块
+- `PayloadKind::WaitForPending`：允许等待正在构建中的 pending payload
+
+这很贴合 Engine API 的差异化需求。有些路径上，客户端必须快速响应；有些路径上，可以稍微等一下正在执行的 payload，争取返回更好的块。
+
+#### KeepPayloadJobAlive：把取消安全放进接口
+
+```rust
+pub enum KeepPayloadJobAlive {
+    Yes,
+    No,
+}
+```
+
+这看起来只是一个小 enum，但它承载的是 Engine API 的一个关键语义：共识层调用 `engine_getPayload` 之后，执行客户端可以停止对应的构建过程。
+
+reth 没有把这个行为藏在实现细节里，而是让 `resolve_kind` 同时返回：
+
+```rust
+(ResolvePayloadFuture, KeepPayloadJobAlive)
+```
+
+这意味着 payload job 的实现者必须认真面对两个问题：
+
+1. payload 被取走后，继续构建还有没有意义？
+2. 如果任务被 drop，是否会留下半写入状态或丢失必须返回的数据？
+
+源码注释里也明确要求：`PayloadJob` 需要是 cancel safe。原因是共识层请求 payload 后，客户端可能直接丢弃构建任务。如果实现里把关键状态只放在 future 的局部变量中，取消时就可能丢掉已经构建好的 payload；而这个 trait 的形状迫使实现把“可返回的最佳 payload”维护成任务的稳定状态。
+
+#### 为什么这个设计很漂亮？
+
+**1. 它把协议时限变成类型接口，而不是散落的超时逻辑**
+
+Engine API 要求 `engine_getPayload` 快速返回。reth 没有只是在某个调用点写一个 timeout，而是让整个 payload builder 抽象都围绕“随时可返回”设计。
+
+```rust
+fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError>;
+```
+
+这个方法的存在本身就是一种约束：任何实现都不能只在最后一刻产出结果。
+
+**2. 它承认 payload 构建是持续优化，不是一次性计算**
+
+交易选择、EVM 执行、blob 处理、收益优化都可能不断改进候选块。`PayloadJob` 允许任务作为 future 被持续 poll，同时用 `best_payload()` 暴露当前成果。
+
+这比“启动任务 -> 等待完成 -> 返回结果”的模型更符合区块构建的真实工作方式。
+
+**3. 它把取消后的生命周期处理显式化**
+
+`KeepPayloadJobAlive` 让调用者和实现者都能清楚表达：payload 被共识层取走以后，这个构建任务是否还应该继续。
+
+例如：
+
+- validator 只需要这个 slot 的 payload，取走后可以停止
+- 某些 builder 策略可能希望继续一小段时间，供后续请求复用或观测
+
+这个选择不应该藏在后台任务里，否则很难推理资源占用和取消安全。
+
+**4. 它为不同链和不同 builder 策略留出了空间**
+
+`PayloadAttributes`、`BuiltPayload`、`ResolvePayloadFuture` 都是关联类型。这意味着同一套 payload service 抽象可以服务不同链、不同 payload 格式、不同 builder 策略，而不用把以太坊主网的具体结构硬编码进 trait。
+
+#### 对比朴素设计
+
+**朴素设计：**
+
+```rust
+async fn build_payload(attrs: PayloadAttributes) -> Result<BuiltPayload, Error> {
+    // 构建完整 payload
+}
+```
+
+问题：
+
+- ❌ 构建没完成前没有可返回结果
+- ❌ 很难表达“先返回空块，后续继续优化”
+- ❌ 取消时容易丢掉局部状态
+- ❌ `engine_getPayload` 的 deadline 只能靠外层 timeout 补救
+
+**PayloadJob 设计：**
+
+```rust
+trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>> {
+    fn best_payload(&self) -> Result<Self::BuiltPayload, PayloadBuilderError>;
+    fn resolve_kind(...) -> (Self::ResolvePayloadFuture, KeepPayloadJobAlive);
+}
+```
+
+优势：
+
+- ✅ 构建过程中始终有当前最佳 payload
+- ✅ 快速返回和等待 pending payload 是显式策略
+- ✅ payload 被请求后是否继续运行是显式决策
+- ✅ trait 层面提醒实现者必须 cancel safe
+
+#### 学习要点
+
+- ✅ **协议约束驱动接口设计**：Engine API 的 deadline 直接塑造 trait 形状
+- ✅ **持续优化模型**：把 payload 构建看成不断产生更好结果的任务
+- ✅ **取消安全**：异步任务被 drop 也是正常控制流，不能当异常处理
+- ✅ **生命周期显式化**：`KeepPayloadJobAlive` 让资源管理和协议语义对齐
+
+---
+
 ## 总结
 
 ### Rust 技巧
@@ -662,6 +865,7 @@ if list.contains(150000) {
 | **增量 State Root** | 只计算变化部分 | 计算时间 1000x+ |
 | **列式存储** | 冷热分离 | 存储压缩 10x，查询加速 10-20x |
 | **Sharded Index** | 数据分片 | 读写效率 100x |
+| **PayloadJob** | 持续构建当前最佳 payload | 避免错过 PoS slot deadline |
 
 ### 设计哲学
 
