@@ -16,6 +16,12 @@
   - [6. Static Files 列式存储](#6-static-files-列式存储)
   - [7. Sharded History Index](#7-sharded-history-index)
   - [8. PayloadJob - 可取消的增量 Payload 构建](#8-payloadjob---可取消的增量-payload-构建)
+  - [9. ExEx WAL - 外部执行扩展的可恢复通知日志](#9-exex-wal---外部执行扩展的可恢复通知日志)
+  - [10. CommitOrder - 跨存储 Unwind 的崩溃恢复顺序](#10-commitorder---跨存储-unwind-的崩溃恢复顺序)
+  - [11. RevealableSparseTrie - 盲态和揭示态的按需 Trie](#11-revealablesparsetrie---盲态和揭示态的按需-trie)
+  - [12. Arena Sparse Trie - Blinded Child 与 Dirty Cache](#12-arena-sparse-trie---blinded-child-与-dirty-cache)
+  - [13. BestTransactions - 按 Nonce 解锁的交易选择器](#13-besttransactions---按-nonce-解锁的交易选择器)
+  - [14. FullNodeComponents - 用关联类型组装可替换节点内核](#14-fullnodecomponents---用关联类型组装可替换节点内核)
 
 ---
 
@@ -847,6 +853,581 @@ trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>> {
 
 ---
 
+### 9. ExEx WAL - 外部执行扩展的可恢复通知日志
+
+**位置**: [`crates/exex/exex/src/wal/mod.rs:28`](../../crates/exex/exex/src/wal/mod.rs#L28)
+
+#### 设计目的
+
+ExEx（Execution Extension）可以理解为挂在 reth 节点旁边的外部状态机：它消费 canonical chain notification，构建自己的索引、证明、衍生状态或外部服务。
+
+如果 ExEx 只依赖实时 channel 消息，会遇到几个问题：
+
+- 节点或 ExEx 重启后，已经发过的通知可能丢失
+- ExEx 处理速度慢于节点同步速度时，需要追赶
+- reorg 时不仅要知道新增 canonical blocks，还要知道哪些 blocks 被 revert
+- finalized 后，旧通知又不能无限保留
+
+所以 reth 为 ExEx 做了一个 WAL（write-ahead log），把 chain notification 先持久化，再交给 ExEx 消费。
+
+#### 核心实现
+
+```rust
+// 源码：crates/exex/exex/src/wal/mod.rs:28-40
+pub struct Wal<N: NodePrimitives = EthPrimitives> {
+    inner: Arc<WalInner<N>>,
+}
+
+struct WalInner<N: NodePrimitives> {
+    next_file_id: AtomicU32,
+    storage: Storage<N>,
+    block_cache: RwLock<BlockCache>,
+    metrics: Metrics,
+}
+```
+
+WAL 的工作模式很像数据库复制日志：
+
+```rust
+// 每次 canonical chain 通知都先写 WAL
+wal.commit(&notification)?;
+
+// chain finalized 后，清理已经不再需要的历史通知
+wal.finalize(finalized_block)?;
+
+// ExEx 重启或落后时，可以重新迭代通知
+for notification in wal.iter_notifications()? {
+    exex.apply(notification?)?;
+}
+```
+
+#### BlockCache 的关键作用
+
+源码注释里提到，WAL 底层是二进制文件目录，旁边配一个 `BlockCache`：
+
+```rust
+storage: Storage<N>,
+block_cache: RwLock<BlockCache>,
+```
+
+这个 cache 的作用不是缓存数据本身，而是缓存“区块和 WAL 文件”的索引关系。否则每次需要：
+
+- 根据 block hash 找 notification
+- 判断哪些通知可以 finalize
+- 重启后恢复 WAL 状态
+
+都要扫描目录、读取文件、解码 notification。`BlockCache` 把这些操作变成内存索引查询。
+
+#### 为什么有趣？
+
+**1. 它把 ExEx 从“实时订阅者”升级成“可恢复消费者”**
+
+普通事件订阅的语义是：你在线，我发给你；你不在线，你自己负责。
+
+ExEx WAL 的语义更像：
+
+```text
+canonical notification -> WAL -> ExEx consumer
+```
+
+这让 ExEx 可以有自己的处理进度和恢复逻辑，不必和节点主流程强耦合。
+
+**2. 它同时记录 commit 和 revert**
+
+ExEx 不是只处理新块。以太坊执行层最麻烦的地方之一是 reorg：之前看起来 canonical 的块可能被回滚。
+
+WAL 记录的是 `ExExNotification`，里面可以包含 committed chain 和 reverted chain。这样外部执行扩展拿到的是状态转换，而不是单个新区块事件。
+
+**3. 它用 finalized 作为日志截断边界**
+
+WAL 不能无限增长，但也不能过早删除。reth 把 `finalize(to_block)` 作为清理入口：
+
+```rust
+pub fn finalize(&self, to_block: BlockNumHash) -> WalResult<()>
+```
+
+这和以太坊 PoS 的 finality 语义对齐：finalized 之前可能还需要支持 reorg 和慢消费者恢复；finalized 之后可以安全截断。
+
+#### 学习要点
+
+- ✅ **事件流持久化**：重要事件不要只靠内存 channel
+- ✅ **消费者进度解耦**：ExEx 可以落后、重启、恢复
+- ✅ **状态转换优于单点事件**：通知里同时包含 commit/revert 信息
+- ✅ **finality 驱动清理**：用协议 finality 决定日志生命周期
+
+---
+
+### 10. CommitOrder - 跨存储 Unwind 的崩溃恢复顺序
+
+**位置**: [`crates/storage/provider/src/providers/database/provider.rs:87`](../../crates/storage/provider/src/providers/database/provider.rs#L87)
+
+#### 设计目的
+
+reth 的存储不是单一数据库：
+
+- MDBX 保存热数据、索引、checkpoint 等
+- Static files 保存冷历史数据
+- RocksDB 在部分 storage 模式下承载状态相关数据
+
+正常写入和 unwind 写入对崩溃恢复的要求不同。`CommitOrder` 用一个很小的 enum 明确区分两种提交顺序。
+
+#### 核心实现
+
+```rust
+// 源码：crates/storage/provider/src/providers/database/provider.rs:87-95
+pub enum CommitOrder {
+    /// Normal commit order: static files first, then `RocksDB`, then MDBX.
+    Normal,
+    /// Unwind commit order: MDBX first, then `RocksDB`, then static files.
+    Unwind,
+}
+```
+
+正常提交路径：
+
+```rust
+// 源码：provider.rs:3882-3894
+self.static_file_provider.finalize()?;
+self.rocksdb_provider.commit_batch(batch)?;
+self.tx.commit()?; // MDBX
+```
+
+unwind 提交路径：
+
+```rust
+// 源码：provider.rs:273-289
+self.tx.commit()?; // MDBX
+reader_txn_tracker.wait_for_pre_commit_readers();
+self.rocksdb_provider.commit_batch(batch)?;
+self.static_file_provider.commit()?;
+```
+
+#### 为什么正常路径是 static files -> RocksDB -> MDBX？
+
+正常前进写入时，MDBX 里的 checkpoint 和索引更像“可见进度”。如果先提交 MDBX，再提交 static files，中途崩溃后，系统可能看到 checkpoint 已经前进，但对应静态文件还没有完整落盘。
+
+所以正常路径先让数据文件 durable，最后提交 MDBX 里的可见状态。
+
+#### 为什么 unwind 路径要反过来？
+
+unwind 是回滚链状态，目标是把数据库退回到更早高度。这里最重要的是：如果中途崩溃，下一次启动能知道应该从哪里恢复。
+
+源码注释说得很直接：unwind 时先提交 MDBX，是为了让中断后的恢复可以通过 checkpoint 截断 static files。
+
+也就是说，unwind 的 durable truth 先写入 MDBX；如果 static files 还没来得及截断，下次启动可以根据 MDBX checkpoint 再修正。
+
+#### ReaderTxnTracker 的细节
+
+unwind 提交 MDBX 后，还会等待旧 reader：
+
+```rust
+reader_txn_tracker.wait_for_pre_commit_readers();
+```
+
+这是一个非常工程化的细节。MDBX 读事务可能还持有旧视图，如果 MDBX 已经回滚而 RocksDB/static files 又继续变化，旧 reader 可能看到跨存储不一致的组合。等待旧 reader 退出，可以避免 unwind 期间的可见性错位。
+
+#### 为什么有趣？
+
+**1. 它承认“跨存储事务”不是免费的**
+
+MDBX、RocksDB、static files 之间没有一个真正的分布式事务。reth 没有假装它们能原子提交，而是用提交顺序和恢复规则构造可恢复性。
+
+**2. 同一个 commit 操作在不同语义下顺序不同**
+
+正常前进和 unwind 回滚都叫 commit，但它们的故障模型不同。用 `CommitOrder` 显式表达，比在代码里散落条件判断更清晰。
+
+**3. checkpoint 被当作恢复协议的一部分**
+
+这不是单纯“写文件成功就行”，而是设计了崩溃后如何判断哪些文件应该保留、哪些应该截断。
+
+#### 学习要点
+
+- ✅ **跨存储一致性**：没有原子事务时，用提交顺序设计恢复协议
+- ✅ **正向写入和回滚写入分开建模**：同一组数据，故障语义不同
+- ✅ **checkpoint 是协议**：不仅记录进度，也服务崩溃恢复
+- ✅ **读事务可见性**：unwind 时要考虑旧 reader 的跨存储视图
+
+---
+
+### 11. RevealableSparseTrie - 盲态和揭示态的按需 Trie
+
+**位置**: [`crates/trie/sparse/src/trie.rs:21`](../../crates/trie/sparse/src/trie.rs#L21)
+
+#### 设计目的
+
+以太坊 state trie 极大。执行一个区块时，只会访问很少一部分账户和 storage slot。如果为了计算 state root 或验证 witness 就把整棵 trie 加载进内存，成本会非常高。
+
+`RevealableSparseTrie` 的设计是：**默认什么节点都不展开，只在需要访问或更新某条路径时 reveal 对应节点**。
+
+#### 核心实现
+
+```rust
+// 源码：crates/trie/sparse/src/trie.rs:21-35
+pub enum RevealableSparseTrie<T = ParallelSparseTrie> {
+    Blind(Option<Box<T>>),
+    Revealed(Box<T>),
+}
+```
+
+两种状态含义很清楚：
+
+| 状态 | 含义 | 能做什么 |
+|------|------|----------|
+| `Blind` | 没有展开任何节点 | 省内存，不能直接查询修改 |
+| `Revealed` | 已经展开部分节点 | 可查询、修改、计算 root |
+
+`Blind(Option<Box<T>>)` 里的 `Option<Box<T>>` 很有意思。它不是业务数据，而是复用内存的容器：
+
+```rust
+// 源码：trie.rs:227-240
+Self::Revealed(mut trie) => {
+    trie.clear();
+    Self::Blind(Some(trie))
+}
+```
+
+清空后不是直接释放，而是把已分配的 sparse trie 放回 blind 状态，下一次 payload 执行可以复用 arena、Vec 等内存。
+
+#### reveal_root：从盲态进入可操作状态
+
+```rust
+pub fn reveal_root(
+    &mut self,
+    root: TrieNodeV2,
+    masks: Option<BranchNodeMasks>,
+    retain_updates: bool,
+) -> SparseTrieResult<&mut T>
+```
+
+如果当前是 blind，就用 root node 初始化内部 trie；如果 blind 状态里带着旧的 cleared trie，就优先复用那份内存。
+
+这个接口表达了一个很重要的边界：在没有 proof/witness 提供节点之前，trie 只是一个承诺，不是完整数据结构。
+
+#### root_with_updates：root 和持久化 diff 一起产出
+
+```rust
+pub fn root_with_updates(&mut self) -> Option<(B256, SparseTrieUpdates)> {
+    let revealed = self.as_revealed_mut()?;
+    Some((revealed.root(), revealed.take_updates()))
+}
+```
+
+计算 root 的同时取出更新信息，这很适合执行客户端：
+
+- root 用来验证区块头
+- updates 用来写回 trie database
+- 没有 reveal 的部分保持原样，不需要重写
+
+#### 为什么有趣？
+
+**1. 它把“未知但可信”作为显式状态**
+
+Merkle Patricia Trie 的核心是 hash commitment。你不需要知道整棵树，只要知道某些路径和兄弟 hash，就能验证和更新局部路径。
+
+`Blind` 状态正是这个思想的代码表达：这棵 trie 存在，但当前内存里没有展开节点。
+
+**2. 它适合 witness/stateless 方向**
+
+未来客户端越来越依赖 witness、proof、partial state。`RevealableSparseTrie` 的抽象天然适合“按 proof 揭示节点”的工作方式。
+
+**3. 它把性能优化做进状态转换**
+
+`Blind(Some(Box<T>))` 这种设计很朴素但有效：payload 执行频繁创建/清空 trie，如果每次都释放再分配，会增加 allocator 压力。把 cleared trie 放回 blind 状态，可以省掉大量重复分配。
+
+#### 学习要点
+
+- ✅ **按需展开**：只加载 touched path，不加载整棵 state trie
+- ✅ **承诺优先**：hash commitment 允许 unknown subtree 留在 blind 状态
+- ✅ **更新追踪**：root 计算和 trie updates 一起产出
+- ✅ **内存复用**：状态机里顺手保存可复用分配
+
+---
+
+### 12. Arena Sparse Trie - Blinded Child 与 Dirty Cache
+
+**位置**: [`crates/trie/sparse/src/arena/nodes.rs:13`](../../crates/trie/sparse/src/arena/nodes.rs#L13)
+
+#### 设计目的
+
+`RevealableSparseTrie` 解决的是整棵 trie 是否展开的问题；arena sparse trie 进一步解决“已经展开的部分如何高效表示和更新”。
+
+核心是两个小状态机：
+
+```rust
+pub enum ArenaSparseNodeState {
+    Revealed,
+    Cached { rlp_node: RlpNode },
+    Dirty,
+}
+
+pub enum ArenaSparseNodeBranchChild {
+    Revealed(Index),
+    Blinded(RlpNode),
+}
+```
+
+#### Dirty/Cached/Revealed：节点哈希的增量缓存
+
+节点状态表达的是 RLP/hash 是否还能复用：
+
+| 状态 | 含义 |
+|------|------|
+| `Revealed` | 节点已展开，但还没有缓存 RLP |
+| `Cached` | RLP 编码仍然有效，可以复用 hash |
+| `Dirty` | 子节点或值变化，需要重新编码/哈希 |
+
+当 branch 插入或删除 child 时，直接把状态标 dirty：
+
+```rust
+pub(super) fn set_child(&mut self, nibble: u8, child: ArenaSparseNodeBranchChild) {
+    let insert_pos = BranchChildIdx::insertion_point(self.state_mask, nibble);
+    self.state_mask.set_bit(nibble);
+    self.children.insert(insert_pos.get(), child);
+    self.state = ArenaSparseNodeState::Dirty;
+}
+```
+
+这避免了每次局部修改都从 root 全量重算。只有 dirty 路径需要重新编码和哈希。
+
+#### Blinded Child：知道 hash，不展开节点
+
+branch child 可以是：
+
+```rust
+Revealed(Index)  // 子节点在 arena 里
+Blinded(RlpNode) // 子节点没有展开，只知道 RLP/hash
+```
+
+这是 MPT 很自然但实现上很巧的优化。一个 branch 的某个 child 没有被访问过，执行客户端仍然可以保留它的 RLP/hash。计算父节点 hash 时，这个 blinded child 仍然可以参与 commitment；只有真的访问这条路径时才 reveal。
+
+#### Dense children + state_mask
+
+branch 不用固定 16 个 child slot，而是：
+
+```rust
+children: SmallVec<[ArenaSparseNodeBranchChild; 4]>,
+state_mask: TrieMask,
+```
+
+`state_mask` 表示 16 个 nibble 位置哪些存在 child，`children` 则紧凑保存实际 child。这样既保留 MPT 的 16 路语义，又避免大多数 branch 浪费 16 个指针空间。
+
+`SmallVec<[...; 4]>` 也很贴合 trie 分布：很多 branch 的实际 child 数不多，少量 child 可以直接存在栈内联空间里，减少堆分配。
+
+#### 为什么有趣？
+
+**1. 它把 Merkle commitment 用到了极致**
+
+未展开子树不是“缺数据”，而是“有 hash commitment 的 blinded child”。这允许 trie 在局部已知的情况下继续正确计算父节点。
+
+**2. 修改传播是 dirty path，不是整树重算**
+
+`Dirty` 状态让更新成本和 touched paths 相关，而不是和整棵 trie 大小相关。
+
+**3. 数据结构同时照顾 CPU cache 和内存占用**
+
+arena index、dense children、SmallVec、bitmask，这些都是低层性能取舍。它不是为了抽象优雅，而是为了执行客户端热路径能跑得快。
+
+#### 学习要点
+
+- ✅ **Blinded child**：未访问子树保留 RLP/hash，不强制展开
+- ✅ **Dirty cache**：只重算被修改影响的路径
+- ✅ **Bitmask + dense array**：保留 16 路语义，同时压缩实际存储
+- ✅ **Arena index**：用稳定索引组织节点，减少引用和所有权复杂度
+
+---
+
+### 13. BestTransactions - 按 Nonce 解锁的交易选择器
+
+**位置**: [`crates/transaction-pool/src/pool/best.rs:85`](../../crates/transaction-pool/src/pool/best.rs#L85)
+
+#### 设计目的
+
+交易池不能只是一个按 gas price 排序的大堆。以太坊账户 nonce 强制同一个 sender 的交易顺序执行：
+
+```text
+sender A: nonce 7 -> nonce 8 -> nonce 9
+```
+
+即使 nonce 9 的 tip 很高，只要 nonce 7 或 8 没执行，它就不能被打包。`BestTransactions` 的设计就是把这种“同 sender 串行、不同 sender 并行竞争”的规则编码进迭代器。
+
+#### 核心实现
+
+```rust
+pub struct BestTransactions<T: TransactionOrdering> {
+    all: OrdMap<TransactionId, PendingTransaction<T>>,
+    independent: BTreeSet<PendingTransaction<T>>,
+    invalid: HashSet<SenderId>,
+    new_transaction_receiver: Option<Receiver<PendingTransaction<T>>>,
+    last_priority: Option<Priority<T::PriorityValue>>,
+    skip_blobs: bool,
+}
+```
+
+这里最关键的是 `all` 和 `independent` 的分工：
+
+| 字段 | 含义 |
+|------|------|
+| `all` | pending pool 快照里的所有 gapless 交易 |
+| `independent` | 当前可以立即执行的交易，也就是每个 sender 的最低 nonce |
+
+#### 解锁模型
+
+迭代器每次弹出当前最高优先级的 independent 交易：
+
+```rust
+let best = self.pop_best()?;
+```
+
+弹出 nonce `N` 后，才把同 sender 的 nonce `N + 1` 放进 `independent`：
+
+```rust
+if let Some(unlocked) = self.all.get(&best.unlocks()) {
+    self.independent.insert(unlocked.clone());
+}
+```
+
+这就把 nonce 依赖建模成一个解锁链：
+
+```text
+A7 可选
+A8 等 A7 被选中后解锁
+A9 等 A8 被选中后解锁
+
+B3 可选
+B4 等 B3 被选中后解锁
+```
+
+最终排序不是全局所有交易排序，而是“所有 sender 当前头部交易”的竞争。
+
+#### invalid sender：一次失败剪掉整条 nonce 链
+
+如果某个 sender 的交易在执行时被证明无效，后续同 sender 更高 nonce 交易也不能继续执行。`BestTransactions` 用 sender 级别的 invalid set 处理：
+
+```rust
+pub(crate) fn mark_invalid(&mut self, tx: &Arc<ValidPoolTransaction<T::Transaction>>, ...) {
+    self.invalid.insert(tx.sender_id());
+}
+```
+
+之后这个 sender 的交易都会被跳过。这比逐个标记后续交易更简单，也更符合 nonce 链的依赖结构。
+
+#### 新交易流入时的稳定性
+
+`BestTransactions` 还可以接收创建迭代器之后新进入 pending pool 的交易：
+
+```rust
+new_transaction_receiver: Option<Receiver<PendingTransaction<T>>>,
+last_priority: Option<Priority<T::PriorityValue>>,
+```
+
+`last_priority` 用来避免已经返回了较低优先级交易之后，又插入更高优先级交易破坏迭代顺序。新交易要么立即 process，要么先 stash 到 `all`，等待合适时机解锁。
+
+#### 为什么有趣？
+
+**1. 它不是“排序列表”，而是“依赖图迭代器”**
+
+交易选择表面上是按收益排序，实际上还要满足 nonce、basefee、blob、余额等约束。`BestTransactions` 把最核心的 nonce 约束做成了解锁过程。
+
+**2. 它把 EVM 账户模型直接反映到数据结构**
+
+同 sender 是链，不同 sender 是竞争集合。`independent` 保存每条链的头部，这正好对应以太坊账户 nonce 的执行语义。
+
+**3. 它支持边迭代边吸收新交易**
+
+出块构建不是静态过程，交易池会持续变化。这个 iterator 允许在不重建整个候选集的情况下吸收新 pending 交易。
+
+#### 学习要点
+
+- ✅ **约束排序**：交易收益排序必须服从 nonce 依赖
+- ✅ **解锁模型**：执行 nonce `N` 后才释放 `N + 1`
+- ✅ **失败剪枝**：sender 失败后跳过整条后续 nonce 链
+- ✅ **动态迭代**：构建 payload 时可以吸收新 pending 交易
+
+---
+
+### 14. FullNodeComponents - 用关联类型组装可替换节点内核
+
+**位置**: [`crates/node/api/src/node.rs:66`](../../crates/node/api/src/node.rs#L66)
+
+#### 设计目的
+
+reth 不是只想写死一个 Ethereum mainnet client。它希望同一套 node builder 可以支持不同链、不同交易类型、不同 EVM 配置、不同 provider 和 payload 类型。
+
+这个目标靠大量 trait 和关联类型组合完成，其中 `FullNodeTypes` 和 `FullNodeComponents` 是核心边界。
+
+#### 核心实现
+
+```rust
+pub trait FullNodeTypes: Clone + Debug + Send + Sync + Unpin + 'static {
+    type Types: NodeTypes;
+    type DB: Database + DatabaseMetrics + Clone + Unpin + 'static;
+    type Provider: FullProvider<NodeTypesWithDBAdapter<Self::Types, Self::DB>>;
+}
+
+pub trait FullNodeComponents: FullNodeTypes + Clone + 'static {
+    type Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Self::Types>>> + Unpin;
+    type Evm: ConfigureEvm<Primitives = <Self::Types as NodeTypes>::Primitives>;
+    type Consensus: FullConsensus<<Self::Types as NodeTypes>::Primitives> + Clone + Unpin + 'static;
+    type Network: FullNetwork;
+}
+```
+
+这里的约束非常密集，但目的很明确：让组件之间的类型关系在编译期闭合。
+
+例如：
+
+- pool 里的交易必须和节点 primitives 的 consensus transaction 对齐
+- EVM config 必须使用同一套 primitives
+- consensus 必须验证同一套 block/header/transaction 类型
+- provider 必须绑定同一个 `NodeTypes + DB`
+
+#### AddOnsContext：扩展只拿完整节点上下文
+
+```rust
+pub struct AddOnsContext<'a, N: FullNodeComponents> {
+    pub node: N,
+    pub config: &'a NodeConfig<<N::Types as NodeTypes>::ChainSpec>,
+    pub beacon_engine_handle: ConsensusEngineHandle<<N::Types as NodeTypes>::Payload>,
+    pub engine_events: EventSender<ConsensusEngineEvent<<N::Types as NodeTypes>::Primitives>>,
+    pub jwt_secret: JwtSecret,
+}
+```
+
+RPC、监控、ExEx 等 add-on 启动时拿到的是已经类型闭合的完整节点。它不需要猜测当前节点用什么 payload 或 chain spec，因为这些都从 `N: FullNodeComponents` 推导出来。
+
+#### 为什么有趣？
+
+**1. 它把“可替换”做在类型层，而不是运行时配置层**
+
+很多系统用 enum 或 trait object 在运行时分发不同链实现。reth 更偏向把链类型、payload 类型、EVM 类型作为关联类型固定下来，让编译器检查组件是否匹配。
+
+**2. 它避免了组件错配**
+
+如果 pool 接收的交易类型和 EVM 执行的交易类型不一致，或者 consensus 验证的 block primitives 和 provider 存储的 primitives 不一致，这类错误应该在编译期暴露，而不是节点启动后才报错。
+
+**3. 它让 Ethereum mainnet 成为一个实例，而不是架构本身**
+
+Ethereum 节点只是实现这些 trait 的一组具体类型。builder、RPC add-ons、payload service 等更高层逻辑可以尽量写成泛型。
+
+#### 代价是什么？
+
+这个设计的代价也很明显：
+
+- trait bound 很长
+- 编译错误可能很复杂
+- 新贡献者理解类型关系需要时间
+
+但对 execution client 这种大型系统来说，这个代价是合理的。因为一旦类型边界稳定，很多跨组件错配会被编译器挡住。
+
+#### 学习要点
+
+- ✅ **关联类型作为架构边界**：组件关系在 trait 里闭合
+- ✅ **编译期组件匹配**：pool、EVM、consensus、provider 使用同一套 primitives
+- ✅ **扩展上下文泛型化**：add-ons 基于完整节点类型启动
+- ✅ **主网实现不是硬编码架构**：Ethereum 是默认实例，不是唯一形态
+
+---
+
 ## 总结
 
 ### Rust 技巧
@@ -866,6 +1447,12 @@ trait PayloadJob: Future<Output = Result<(), PayloadBuilderError>> {
 | **列式存储** | 冷热分离 | 存储压缩 10x，查询加速 10-20x |
 | **Sharded Index** | 数据分片 | 读写效率 100x |
 | **PayloadJob** | 持续构建当前最佳 payload | 避免错过 PoS slot deadline |
+| **ExEx WAL** | 持久化 canonical 通知 | ExEx 可恢复、可追赶 |
+| **CommitOrder** | 按故障模型调整提交顺序 | 跨存储 unwind 可恢复 |
+| **RevealableSparseTrie** | 只 reveal touched paths | 降低 trie 内存和重算成本 |
+| **Arena Sparse Trie** | Blinded child + dirty cache | 局部更新、局部重哈希 |
+| **BestTransactions** | 按 nonce 链解锁候选交易 | 交易选择符合 EVM 账户语义 |
+| **FullNodeComponents** | 关联类型闭合组件关系 | 编译期防止节点组件错配 |
 
 ### 设计哲学
 
